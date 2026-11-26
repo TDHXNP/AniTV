@@ -14,19 +14,35 @@ struct HomePosterItem: Identifiable, Equatable, Sendable {
     let subtitle: String
     let posterURL: URL?
     let progressText: String?
+    let epStatus: Int
+    let totalEpisodes: Int
 
     init(
         id: Int,
         title: String,
         subtitle: String = "",
         posterURL: URL?,
-        progressText: String? = nil
+        progressText: String? = nil,
+        epStatus: Int = 0,
+        totalEpisodes: Int = 0
     ) {
         self.id = id
         self.title = title
         self.subtitle = subtitle
         self.posterURL = posterURL
         self.progressText = progressText
+        self.epStatus = epStatus
+        self.totalEpisodes = totalEpisodes
+    }
+
+    func toTopShelfEntry() -> TopShelfEntry {
+        TopShelfEntry(
+            subjectID: id,
+            title: title,
+            posterURL: posterURL?.absoluteString,
+            epStatus: epStatus,
+            totalEpisodes: totalEpisodes
+        )
     }
 }
 
@@ -136,7 +152,9 @@ struct HomeContentService: Sendable {
             title: title,
             subtitle: subject.shortSummary,
             posterURL: URL(string: poster),
-            progressText: collection.epStatus > 0 ? "看到第 \(collection.epStatus) 集" : nil
+            progressText: collection.epStatus > 0 ? "看到第 \(collection.epStatus) 集" : nil,
+            epStatus: collection.epStatus,
+            totalEpisodes: subject.eps
         )
     }
 }

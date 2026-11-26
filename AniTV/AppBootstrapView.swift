@@ -50,6 +50,7 @@ final class AppBootstrapModel: ObservableObject {
     private let database: DatabaseQueue
     private var didStart = false
     private weak var bangumiOAuthManager: BangumiOAuthManager?
+    private var oauthSessionCancellable: AnyCancellable?
     private var bangumiTokenRefreshTask: Task<Void, Never>?
     private var bangumiDataRefreshLoopTask: Task<Void, Never>?
     private var bangumiDataRefreshTask: Task<Void, Never>?
@@ -60,7 +61,18 @@ final class AppBootstrapModel: ObservableObject {
     }
 
     func setBangumiOAuthManager(_ bangumiOAuthManager: BangumiOAuthManager) {
+        bangumiOAuthManager.configure(database: database)
+        guard self.bangumiOAuthManager !== bangumiOAuthManager else { return }
         self.bangumiOAuthManager = bangumiOAuthManager
+        oauthSessionCancellable = bangumiOAuthManager.$authenticatedSession
+            .compactMap { $0 }
+            .sink { [weak self, weak bangumiOAuthManager] session in
+                Task { @MainActor [weak self, weak bangumiOAuthManager] in
+                    guard let self else { return }
+                    let consumed = bangumiOAuthManager?.consumeAuthenticatedSession() ?? session
+                    await self.finishBangumiLogin(session: consumed)
+                }
+            }
     }
 
     func startIfNeeded() async {
@@ -139,6 +151,10 @@ final class AppBootstrapModel: ObservableObject {
 
             phase = .ready
             startBangumiDataRefreshLoopIfNeeded()
+            await AniTVDatabase.syncDanmakuSettingsToUserDefaults(in: database)
+            Task {
+                await syncCachedTopShelfIfAvailable()
+            }
             Task.detached(priority: .utility) {
                 await TmdbSubjectMapManager.shared.ensureLoaded()
             }
@@ -178,6 +194,20 @@ final class AppBootstrapModel: ObservableObject {
 
         phase = .importingMediaSources
         print("[AppBootstrap] Initial media source load finished, updated: \(didUpdate)")
+    }
+
+    private func syncCachedTopShelfIfAvailable() async {
+        guard let profile = try? await AniTVDatabase.currentUserProfile(in: database),
+              profile.isAuthenticated,
+              let bgmUserID = profile.effectiveBgmUserID else {
+            return
+        }
+        if let cached = try? await HomeContentService().cachedContinueWatching(
+            bgmUserID: bgmUserID,
+            database: database
+        ), !cached.isEmpty {
+            TopShelfSharedStore.saveSnapshot(continueWatching: cached.map { $0.toTopShelfEntry() })
+        }
     }
 
     private func startBangumiDataRefreshLoopIfNeeded() {
@@ -298,6 +328,9 @@ struct AppBootstrapView: View {
                             clientSecret: BangumiOAuthManager.sharedClientSecret,
                             redirectURI: BangumiOAuthManager.defaultRedirectURI
                         )
+                    },
+                    onAppearAction: {
+                        bangumiOAuthManager.ensureLANServerRunning()
                     }
                 )
             } else {
@@ -307,13 +340,6 @@ struct AppBootstrapView: View {
         .task {
             model.setBangumiOAuthManager(bangumiOAuthManager)
             await model.startIfNeeded()
-        }
-        .onChange(of: bangumiOAuthManager.authenticatedSession) { _, session in
-            guard let session else { return }
-            let consumed = bangumiOAuthManager.consumeAuthenticatedSession() ?? session
-            Task {
-                await model.finishBangumiLogin(session: consumed)
-            }
         }
     }
 

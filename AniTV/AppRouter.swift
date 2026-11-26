@@ -56,3 +56,42 @@ final class AppRouter: ObservableObject {
         playerDismissRefreshToken += 1
     }
 }
+
+enum DeepLinkAction: Equatable, Sendable {
+    case animeDetail(Int)
+    case playAnime(Int)
+}
+
+@MainActor
+final class DeepLinkCoordinator: ObservableObject {
+    static let shared = DeepLinkCoordinator()
+
+    @Published private(set) var pendingAction: DeepLinkAction?
+
+    private init() {}
+
+    func handle(url: URL) {
+        guard url.scheme?.lowercased() == "anitv" else { return }
+
+        let host = url.host?.lowercased() ?? ""
+        let pathComponents = url.pathComponents.filter { $0 != "/" }
+
+        switch host {
+        case "anime":
+            if let rawID = pathComponents.first, let bgmID = Int(rawID) {
+                pendingAction = .animeDetail(bgmID)
+            }
+        case "play":
+            if let rawID = pathComponents.first, let bgmID = Int(rawID) {
+                pendingAction = .playAnime(bgmID)
+            }
+        default:
+            break
+        }
+    }
+
+    func consumePendingAction() -> DeepLinkAction? {
+        defer { pendingAction = nil }
+        return pendingAction
+    }
+}

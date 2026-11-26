@@ -118,6 +118,7 @@ final class HomeContentStore: ObservableObject {
             isLoadingMoreContinueWatching = false
             continueWatchingOffset = 0
             canLoadMoreContinueWatching = false
+            TopShelfSharedStore.saveSnapshot(continueWatching: [])
             return
         }
 
@@ -140,6 +141,7 @@ final class HomeContentStore: ObservableObject {
                 canLoadMoreContinueWatching = remoteItems.count == continueWatchingPageSize
                 isLoadingContinueWatching = false
             }
+            TopShelfSharedStore.saveSnapshot(continueWatching: remoteItems.map { $0.toTopShelfEntry() })
         } catch {
             print("[HomeContentStore] Failed to refresh continue watching: \(error)")
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -160,6 +162,7 @@ final class HomeContentStore: ObservableObject {
             isLoadingMoreContinueWatching = false
             continueWatchingOffset = 0
             canLoadMoreContinueWatching = false
+            TopShelfSharedStore.saveSnapshot(continueWatching: [])
             return
         }
 
@@ -177,6 +180,7 @@ final class HomeContentStore: ObservableObject {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     continueWatchingItems = cachedItems
                 }
+                TopShelfSharedStore.saveSnapshot(continueWatching: cachedItems.map { $0.toTopShelfEntry() })
             }
         } catch {
             print("[HomeContentStore] Failed to load cached collections: \(error)")
@@ -195,6 +199,7 @@ final class HomeContentStore: ObservableObject {
                 canLoadMoreContinueWatching = remoteItems.count == continueWatchingPageSize
                 isLoadingContinueWatching = false
             }
+            TopShelfSharedStore.saveSnapshot(continueWatching: remoteItems.map { $0.toTopShelfEntry() })
         } catch {
             print("[HomeContentStore] Failed to refresh collections: \(error)")
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -223,6 +228,7 @@ final class HomeContentStore: ObservableObject {
                 trendingItems = items
                 isLoadingTrending = false
             }
+            TopShelfSharedStore.saveSnapshot(recommended: items.map { $0.toTopShelfEntry() })
         } catch {
             print("[HomeContentStore] Failed to load trending subjects: \(error)")
             isLoadingTrending = false

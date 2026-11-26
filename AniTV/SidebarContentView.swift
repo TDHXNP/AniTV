@@ -11,6 +11,7 @@ import SQLiteData
 enum NavigationCategory: String, Hashable {
     case search
     case home
+    case ranking
     case animeList
     case timeline
     case settings
@@ -19,6 +20,7 @@ enum NavigationCategory: String, Hashable {
 struct SidebarContentView: View {
     @Environment(\.resetFocus) private var resetFocus
     @StateObject private var router = AppRouter()
+    @ObservedObject private var deepLinkCoordinator = DeepLinkCoordinator.shared
     @State private var showingProfileSelection = false
     @State private var currentProfile: UserProfile?
     @State private var homeContinueWatchingRefreshToken = 0
@@ -97,6 +99,12 @@ struct SidebarContentView: View {
                         .prefersDefaultFocus(shouldPreferSidebarFocus && router.selectedCategory == .home, in: sidebarFocusScope)
                         .focused($focusedCategory, equals: .home)
 
+                        NavigationLink(value: NavigationCategory.ranking) {
+                            Label("排行榜", systemImage: "trophy")
+                        }
+                        .prefersDefaultFocus(shouldPreferSidebarFocus && router.selectedCategory == .ranking, in: sidebarFocusScope)
+                        .focused($focusedCategory, equals: .ranking)
+
                         NavigationLink(value: NavigationCategory.animeList) {
                             Label("收藏", systemImage: "play.tv")
                         }
@@ -173,7 +181,15 @@ struct SidebarContentView: View {
         }
         .onAppear {
             router.selectedCategory = .home
-            requestSidebarFocus()
+            if let action = deepLinkCoordinator.consumePendingAction() {
+                handleDeepLink(action)
+            } else {
+                requestSidebarFocus()
+            }
+        }
+        .onChange(of: deepLinkCoordinator.pendingAction) { _, newValue in
+            guard newValue != nil, let action = deepLinkCoordinator.consumePendingAction() else { return }
+            handleDeepLink(action)
         }
         .task {
             await loadCurrentProfile()
@@ -241,6 +257,82 @@ struct SidebarContentView: View {
             currentProfile = nil
         }
     }
+
+    private func handleDeepLink(_ action: DeepLinkAction) {
+        router.columnVisibility = .detailOnly
+        router.selectedCategory = .home
+        router.path = []
+
+        switch action {
+        case .animeDetail(let bgmID):
+            router.showAnimeDetail(bgmID)
+        case .playAnime(let bgmID):
+            Task { @MainActor in
+                await openDirectPlaybackFromDeepLink(bgmID: bgmID)
+            }
+        }
+    }
+
+    private func openDirectPlaybackFromDeepLink(bgmID: Int) async {
+        let repository = BangumiRepository()
+        do {
+            async let subjectTask = repository.getSubject(subjectID: bgmID)
+            async let episodesTask = repository.getEpisodes(id: bgmID)
+            let (subject, episodesResponse) = try await (subjectTask, episodesTask)
+            let episodes = episodesResponse.data
+            guard !episodes.isEmpty else {
+                router.showAnimeDetail(bgmID)
+                return
+            }
+
+            let profile = try? await AniTVDatabase.currentUserProfile(in: database)
+            var epStatus = 0
+            if let profile, profile.isAuthenticated, let bgmUserID = profile.effectiveBgmUserID {
+                if let remoteCollection = try? await repository.currentUserCollection(
+                    subjectID: bgmID,
+                    userID: bgmUserID
+                ) {
+                    epStatus = remoteCollection.epStatus
+                }
+            }
+
+            let targetEpisode: BgmEpisodeInfo
+            if epStatus > 0 {
+                let nextSort = Double(epStatus + 1)
+                targetEpisode = episodes.first(where: {
+                    ($0.ep > 0 ? $0.ep : $0.sort) == nextSort
+                }) ?? (episodes.indices.contains(epStatus) ? episodes[epStatus] : episodes.last!)
+            } else {
+                targetEpisode = episodes.first!
+            }
+
+            var resumeSeconds: Int? = nil
+            if let profile, profile.isAuthenticated, let bgmUserID = profile.effectiveBgmUserID {
+                if let watchState = try? await AniTVDatabase.localEpisodeWatchState(
+                    bgmUserID: bgmUserID,
+                    episodeID: targetEpisode.id,
+                    in: database
+                ), watchState.playheadSeconds > 0 {
+                    resumeSeconds = watchState.playheadSeconds
+                }
+            }
+
+            let title = subject.nameCN.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? subject.name
+                : subject.nameCN
+
+            router.showAnimeDetail(bgmID)
+            router.showEpisodePlayer(
+                episodes: episodes,
+                episodeID: targetEpisode.id,
+                sessionTitle: title,
+                initialPlaybackPositionSeconds: resumeSeconds
+            )
+        } catch {
+            print("[SidebarContentView] Failed to open direct playback for subject \(bgmID): \(error)")
+            router.showAnimeDetail(bgmID)
+        }
+    }
 }
 
 private struct SidebarUserAvatarView: View {
@@ -284,7 +376,26 @@ private struct AnimeEpisodePlayerScreen: View {
     let onScreenDisappear: () -> Void
     let onExitRequest: () -> Void
 
-    @State private var currentEpisodeIndex: Int = 0
+    @Dependency(\.defaultDatabase) private var database
+    @State private var currentEpisodeIndex: Int
+
+    init(
+        episodes: [BgmEpisodeInfo],
+        initialEpisodeID: Int,
+        sessionTitle: String,
+        initialPlaybackPositionSeconds: Int?,
+        onScreenDisappear: @escaping () -> Void,
+        onExitRequest: @escaping () -> Void
+    ) {
+        self.episodes = episodes
+        self.initialEpisodeID = initialEpisodeID
+        self.sessionTitle = sessionTitle
+        self.initialPlaybackPositionSeconds = initialPlaybackPositionSeconds
+        self.onScreenDisappear = onScreenDisappear
+        self.onExitRequest = onExitRequest
+        let initialIndex = episodes.firstIndex(where: { $0.id == initialEpisodeID }) ?? 0
+        self._currentEpisodeIndex = State(initialValue: initialIndex)
+    }
 
     private var currentEpisode: BgmEpisodeInfo? {
         guard episodes.indices.contains(currentEpisodeIndex) else { return nil }
@@ -296,8 +407,10 @@ private struct AnimeEpisodePlayerScreen: View {
             if let currentEpisode {
                 AnimePlayerContainerView(
                     episodeInfo: currentEpisode,
+                    episodes: episodes,
                     sessionTitle: sessionTitle,
                     initialPlaybackPositionSeconds: currentEpisode.id == initialEpisodeID ? initialPlaybackPositionSeconds : nil,
+                    onSelectEpisode: selectEpisode,
                     onPlaybackCompleted: playNextEpisodeIfPossible,
                     onExitRequest: onExitRequest
                 )
@@ -306,18 +419,25 @@ private struct AnimeEpisodePlayerScreen: View {
                 Color.black.ignoresSafeArea()
             }
         }
-        .onAppear {
-            currentEpisodeIndex = episodes.firstIndex(where: { $0.id == initialEpisodeID }) ?? 0
-        }
         .onDisappear {
             onScreenDisappear()
         }
     }
 
+    private func selectEpisode(_ episode: BgmEpisodeInfo) {
+        guard let targetIndex = episodes.firstIndex(where: { $0.id == episode.id }) else { return }
+        guard targetIndex != currentEpisodeIndex else { return }
+        currentEpisodeIndex = targetIndex
+    }
+
     private func playNextEpisodeIfPossible() {
         let nextIndex = currentEpisodeIndex + 1
         guard episodes.indices.contains(nextIndex) else { return }
-        currentEpisodeIndex = nextIndex
+        Task { @MainActor in
+            let autoPlayNext = (try? await AniTVDatabase.isAutoPlayNextEnabled(in: database)) ?? AniTVDatabase.defaultAutoPlayNext
+            guard autoPlayNext, episodes.indices.contains(nextIndex) else { return }
+            currentEpisodeIndex = nextIndex
+        }
     }
 
 }
@@ -368,7 +488,7 @@ private struct SidebarDetailView: View {
         Group {
             switch selectedCategory ?? .home {
             case .search:
-                SearchPlaceholderView(
+                SearchView(
                     columnVisibility: $columnVisibility,
                     openAnimeDetail: openAnimeDetail
                 )
@@ -377,6 +497,11 @@ private struct SidebarDetailView: View {
                     openAnimeDetail: openAnimeDetail,
                     continueWatchingRefreshToken: homeContinueWatchingRefreshToken,
                     openEpisodePlayer: openEpisodePlayer
+                )
+            case .ranking:
+                RankingView(
+                    columnVisibility: $columnVisibility,
+                    openAnimeDetail: openAnimeDetail
                 )
             case .animeList:
                 CollectionView(
@@ -393,61 +518,6 @@ private struct SidebarDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
-
-private struct SearchPlaceholderView: View {
-    @Binding var columnVisibility: NavigationSplitViewVisibility
-    let openAnimeDetail: (Int) -> Void
-    @State private var bgmIDText = ""
-
-    private var parsedBgmID: Int? {
-        let trimmed = bgmIDText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let value = Int(trimmed), value > 0 else { return nil }
-        return value
-    }
-
-    var body: some View {
-        VStack(spacing: 24) {
-            ContentUnavailableView(
-                "按 BGM ID 跳转",
-                systemImage: "magnifyingglass",
-                description: Text("输入番剧的 bgmId，确认后直接打开详情页。")
-            )
-
-            VStack(spacing: 16) {
-                TextField("例如：515759", text: $bgmIDText)
-                    .textFieldStyle(.plain)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(.white.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .keyboardType(.numberPad)
-                    .frame(maxWidth: 424)
-
-                if let bgmID = parsedBgmID {
-                    Button {
-                        openAnimeDetail(bgmID)
-                    } label: {
-                        Label("确认并打开详情", systemImage: "arrow.right.circle.fill")
-                            .frame(minWidth: 260)
-                    }
-                    .buttonStyle(.borderedProminent)
-                } else {
-                    Label("请输入有效的正整数 bgmId", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Button("打开侧边栏") {
-                columnVisibility = .all
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-
 
 struct ProfileSwitcherView: View {
     @Environment(\.dismiss) private var dismiss

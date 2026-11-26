@@ -13,7 +13,7 @@ import AVFoundation
 @main
 struct AniTVApp: App {
     let appDatabase: DatabaseQueue
-    @StateObject private var bangumiOAuthManager = BangumiOAuthManager()
+    @StateObject private var bangumiOAuthManager: BangumiOAuthManager
 
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
@@ -40,6 +40,9 @@ struct AniTVApp: App {
         do {
             let database = try AniTVDatabase.makeDefaultDatabase()
             self.appDatabase = database
+            let oauthManager = BangumiOAuthManager()
+            oauthManager.configure(database: database)
+            self._bangumiOAuthManager = StateObject(wrappedValue: oauthManager)
 
             if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil &&
                ProcessInfo.processInfo.environment["XCTestBundlePath"] == nil &&
@@ -61,6 +64,9 @@ struct AniTVApp: App {
             } else {
                 AppBootstrapView(database: appDatabase)
                     .environmentObject(bangumiOAuthManager)
+                    .onOpenURL { url in
+                        DeepLinkCoordinator.shared.handle(url: url)
+                    }
             }
         }
         .modelContainer(sharedModelContainer)
