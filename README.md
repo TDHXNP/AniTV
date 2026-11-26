@@ -61,6 +61,18 @@ AniTV 是 tvOS 平台的 Bangumi 第三方客户端。除了支持管理 Bangumi
 1. **弹幕服务**：可在 **设置 → 播放器与弹幕 → 弹幕服务 (danmu_api)** 中配置你自部署的 [huangxd-/danmu_api](https://github.com/huangxd-/danmu_api) 地址与 Token，并点击「测试连接」验证。
 2. **Top Shelf**：将 AniTV 放在 Apple TV 桌面第一行即可在顶部栏查看「继续播放」与「推荐的项目」；自签安装时建议同时重签内嵌扩展 `PlugIns/AniTVTopShelf.appex` 并为主 App 与扩展配置相同的 App Group。
 
+### GitHub Actions 自动编译与发布
+
+仓库已配置 [release.yml](.github/workflows/release.yml) 工作流：
+
+- **自动发布**：推送 `v*` 格式标签（例如 `git tag v0.2.2 && git push origin v0.2.2`）将自动编译未签名 tvOS Release IPA、生成 SHA-256 校验文件并创建 GitHub Release。
+- **手动触发**：可在 GitHub 仓库的 **Actions → Release tvOS IPA → Run workflow** 中手动触发构建（支持仅导出 Artifact 或直接发布 Release）。
+- **密钥注入（可选）**：在仓库 **Settings → Secrets and variables → Actions** 中配置以下 Secrets（未配置亦可正常编译）：
+  - `BANGUMI_OAUTH_CLIENT_ID`
+  - `BANGUMI_OAUTH_CLIENT_SECRET`
+  - `TMDB_API_KEY`
+  - （或直接上传 base64 编码的 `SECRETS_PLIST_BASE64`）
+
 ## 致谢
 
 - [[AniTV Upstream]](https://github.com/moyuwangP/AniTV) 原项目作者与基础架构
