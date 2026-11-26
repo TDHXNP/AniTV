@@ -444,3 +444,246 @@ struct BgmEpisodeInfo: Codable, Sendable, Hashable {
         self.disc = disc
     }
 }
+
+// MARK: - Subject Search (POST /v0/search/subjects)
+
+struct BgmSearchSubjectDTO: Codable, Identifiable, Sendable {
+    let id: Int
+    let type: Int
+    let name: String
+    let nameCN: String
+    let summary: String
+    let date: String?
+    let platform: String?
+    let images: SubjectImages?
+    let score: Double
+    let rank: Int
+    let totalEpisodes: Int?
+
+    var displayTitle: String {
+        let trimmed = nameCN.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? name : trimmed
+    }
+
+    var posterURL: URL? {
+        guard let raw = images?.large ?? images?.common ?? images?.medium, !raw.isEmpty else {
+            return nil
+        }
+        return URL(string: raw)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, type, name, summary, date, platform, images, score, rank, rating, eps
+        case nameCN = "name_cn"
+        case totalEpisodes = "total_episodes"
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(Int.self, forKey: .id)
+        self.type = (try? container.decode(Int.self, forKey: .type)) ?? 2
+        self.name = (try? container.decode(String.self, forKey: .name)) ?? ""
+        self.nameCN = (try? container.decode(String.self, forKey: .nameCN)) ?? ""
+        self.summary = (try? container.decode(String.self, forKey: .summary)) ?? ""
+        self.date = try? container.decodeIfPresent(String.self, forKey: .date)
+        self.platform = try? container.decodeIfPresent(String.self, forKey: .platform)
+        self.images = try? container.decodeIfPresent(SubjectImages.self, forKey: .images)
+
+        let rating = try? container.decodeIfPresent(SubjectRating.self, forKey: .rating)
+        let directScore = try? container.decodeIfPresent(Double.self, forKey: .score)
+        let directRank = try? container.decodeIfPresent(Int.self, forKey: .rank)
+        self.score = directScore ?? rating?.score ?? 0
+        self.rank = directRank ?? rating?.rank ?? 0
+
+        let totalEps = try? container.decodeIfPresent(Int.self, forKey: .totalEpisodes)
+        let eps = try? container.decodeIfPresent(Int.self, forKey: .eps)
+        self.totalEpisodes = totalEps ?? eps
+    }
+
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(type, forKey: .type)
+        try container.encode(name, forKey: .name)
+        try container.encode(nameCN, forKey: .nameCN)
+        try container.encode(summary, forKey: .summary)
+        try container.encodeIfPresent(date, forKey: .date)
+        try container.encodeIfPresent(platform, forKey: .platform)
+        try container.encodeIfPresent(images, forKey: .images)
+        try container.encode(score, forKey: .score)
+        try container.encode(rank, forKey: .rank)
+        try container.encodeIfPresent(totalEpisodes, forKey: .totalEpisodes)
+    }
+}
+
+// MARK: - Cast & Staff (GET /v0/subjects/{id}/characters & /persons)
+
+struct BgmPersonImages: Codable, Sendable {
+    let large: String?
+    let medium: String?
+    let small: String?
+    let grid: String?
+
+    var preferredURL: URL? {
+        for candidate in [medium, large, grid, small] {
+            if let raw = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !raw.isEmpty {
+                let secureRaw = raw.hasPrefix("http://")
+                    ? "https://" + raw.dropFirst("http://".count)
+                    : raw
+                if let url = URL(string: secureRaw) {
+                    return url
+                }
+            }
+        }
+        return nil
+    }
+}
+
+struct BgmPersonActorDTO: Codable, Identifiable, Sendable {
+    let id: Int
+    let name: String
+    let images: BgmPersonImages?
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(Int.self, forKey: .id)
+        self.name = (try? container.decode(String.self, forKey: .name)) ?? ""
+        self.images = try? container.decodeIfPresent(BgmPersonImages.self, forKey: .images)
+    }
+}
+
+struct BgmRelatedCharacterDTO: Codable, Identifiable, Sendable {
+    let id: Int
+    let name: String
+    let relation: String
+    let images: BgmPersonImages?
+    let actors: [BgmPersonActorDTO]
+
+    var primaryActorName: String? {
+        actors.first?.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, relation, images, actors
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(Int.self, forKey: .id)
+        self.name = (try? container.decode(String.self, forKey: .name)) ?? ""
+        self.relation = (try? container.decode(String.self, forKey: .relation)) ?? ""
+        self.images = try? container.decodeIfPresent(BgmPersonImages.self, forKey: .images)
+        self.actors = (try? container.decodeIfPresent([BgmPersonActorDTO].self, forKey: .actors)) ?? []
+    }
+}
+
+struct BgmRelatedPersonDTO: Codable, Identifiable, Sendable {
+    let id: Int
+    let name: String
+    let relation: String
+    let images: BgmPersonImages?
+    let career: [String]
+
+    var uniqueKey: String {
+        "\(id)-\(relation)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, relation, images, career
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(Int.self, forKey: .id)
+        self.name = (try? container.decode(String.self, forKey: .name)) ?? ""
+        self.relation = (try? container.decode(String.self, forKey: .relation)) ?? ""
+        self.images = try? container.decodeIfPresent(BgmPersonImages.self, forKey: .images)
+        self.career = (try? container.decodeIfPresent([String].self, forKey: .career)) ?? []
+    }
+}
+
+// MARK: - Subject Comments / 吐槽 (GET https://next.bgm.tv/p1/subjects/{id}/comments)
+
+struct BgmCommentUserDTO: Codable, Sendable {
+    let id: Int
+    let username: String
+    let nickname: String
+    let avatar: BgmPersonImages?
+
+    var displayName: String {
+        let trimmed = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? username : trimmed
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, username, nickname, avatar
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = (try? container.decode(Int.self, forKey: .id)) ?? 0
+        self.username = (try? container.decode(String.self, forKey: .username)) ?? ""
+        self.nickname = (try? container.decode(String.self, forKey: .nickname)) ?? ""
+        self.avatar = try? container.decodeIfPresent(BgmPersonImages.self, forKey: .avatar)
+    }
+}
+
+struct BgmSubjectCommentDTO: Codable, Identifiable, Sendable {
+    let id: Int
+    let rate: Int
+    let comment: String
+    let updatedAt: Int
+    let type: Int
+    let user: BgmCommentUserDTO
+
+    var collectionLabel: String {
+        switch type {
+        case 1: return "想看"
+        case 2: return "看过"
+        case 3: return "在看"
+        case 4: return "搁置"
+        case 5: return "抛弃"
+        default: return ""
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, rate, comment, updatedAt, type, user
+        case updatedAtSnake = "updated_at"
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedUser = (try? container.decode(BgmCommentUserDTO.self, forKey: .user))
+            ?? BgmCommentUserDTO(id: 0, username: "", nickname: "匿名用户", avatar: nil)
+        let ts = (try? container.decode(Int.self, forKey: .updatedAt))
+            ?? (try? container.decode(Int.self, forKey: .updatedAtSnake))
+            ?? 0
+        self.id = (try? container.decode(Int.self, forKey: .id)) ?? (decodedUser.id * 100_000 + (ts % 100_000))
+        self.rate = (try? container.decode(Int.self, forKey: .rate)) ?? 0
+        self.comment = (try? container.decode(String.self, forKey: .comment)) ?? ""
+        self.updatedAt = ts
+        self.type = (try? container.decode(Int.self, forKey: .type)) ?? 0
+        self.user = decodedUser
+    }
+
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(rate, forKey: .rate)
+        try container.encode(comment, forKey: .comment)
+        try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encode(type, forKey: .type)
+        try container.encode(user, forKey: .user)
+    }
+}
+
+extension BgmCommentUserDTO {
+    nonisolated init(id: Int, username: String, nickname: String, avatar: BgmPersonImages?) {
+        self.id = id
+        self.username = username
+        self.nickname = nickname
+        self.avatar = avatar
+    }
+}

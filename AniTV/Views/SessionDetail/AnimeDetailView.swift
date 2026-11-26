@@ -29,9 +29,16 @@ struct AnimeDetailView: View {
     @State private var didLoadSubjectCollectionState = false
     @State private var pendingResumePromptEpisode: BgmEpisodeInfo?
     @State private var pendingResumePromptSeconds = 0
+    @State private var showingResumePrompt = false
     @State private var detailRefreshToken = 1
     @State private var shouldPromptMarkWatchingAfterPlayerExit = false
     @State private var showingMarkWatchingPrompt = false
+    @State private var characters: [BgmRelatedCharacterDTO] = []
+    @State private var persons: [BgmRelatedPersonDTO] = []
+    @State private var comments: [BgmSubjectCommentDTO] = []
+    @State private var commentsTotal: Int = 0
+    @State private var isLoadingMoreComments = false
+    @State private var selectedCommentForSheet: BgmSubjectCommentDTO?
 
     private var isBackdropTMDB: Bool {
         backdropURL?.host?.contains("tmdb.org") == true
@@ -76,165 +83,263 @@ struct AnimeDetailView: View {
             }
             .edgesIgnoringSafeArea(.all) // 铺满全屏
             
-            // Layer 2: 内容区域
-            VStack(alignment: .leading, spacing: 40) {
-                Spacer() // 把内容推到底部
-                
-                // A. 顶部元信息区 (标题 + 简介)
-                HStack(alignment: .bottom, spacing: 60) {
-                    VStack(alignment: .leading, spacing: 20) {
-                        // 1. 标题 (优先展示 Logo，回退展示文字)
-                        Group {
-                            switch titleDisplayMode {
-                            case .chineseLogo(let url, let aspect), .originalLogo(let url, let aspect):
-                                KFImage(url)
-                                    .resizable()
-                                    .placeholder {
-                                        Text(displayName)
-                                            .font(.system(size: 60, weight: .heavy, design: .rounded))
-                                            .shadow(radius: 10)
-                                    }
-                                    .aspectRatio(aspect, contentMode: .fit)
-                                    .frame(maxHeight: 120, alignment: .leading)
-                                    .shadow(color: .black.opacity(0.8), radius: 10, x: 0, y: 5)
-                            case .text(let title):
-                                Text(title)
-                                    .font(.system(size: 60, weight: .heavy, design: .rounded))
-                                    .shadow(radius: 10)
-                            }
-                        }
-                        
-                        // 2. 标签行 (年份 | 评分 | 类型)
-                        HStack(spacing: 20) {
-                            if let starts = startDate {
-                                var dateString: String {
-                                    let formatter = DateFormatter()
-                                    formatter.dateFormat = "yyyy年M月"
-                                    return formatter.string(from: starts)
-                                }
-                                BadgeView(text: dateString)
-                            }
-                            BadgeView(text: typeText.uppercased())
-                            if !secondaryTitleText.isEmpty {
-                                Text(secondaryTitleText)
-                            }
-                        }
-                        
-                        ScoreView(
-                            score: score,
-                            count: count,
-                            rank: rank
-                        )
-                        // 给评分和下方的标签加点间距
-                        .padding(.bottom, 10)
-                        
-                        // 3. 简介 (限制行数，白字，focus后黑字白底)
-                        Button(action: { self.showingFullInfo = true }) {
-                            Text(infoText)
-                                .font(.body)
-                                .foregroundColor(isDescriptionFocused ? .black : .white)
-                                .lineLimit(3)
-                                .frame(maxWidth: 900, alignment: .leading)
-                                .background(
-                                    isDescriptionFocused ? Color.white : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .focused($focusedField, equals: "description")
-                        .animation(.easeInOut(duration: 0.18), value: isDescriptionFocused)
-                        
-                        // 4. 操作按钮组
-                        HStack(spacing: 20) {
-                            Button(action: handlePlayButtonTap) {
-                                Label(playButtonTitle, systemImage: "play.fill")
-                                    .padding(.horizontal, 20)
-                                    .padding(.vertical, 10)
-                            }
-                            // 2. 修正这里：参数是 (true, in: namespace)
-                            .prefersDefaultFocus(true, in: focusNamespace)
-                            .focused($focusedField, equals: "playButton")
+            // Layer 2: 内容区域（支持向下滚动查看演职员与吐槽）
+            GeometryReader { screenProxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 44) {
+                        VStack(alignment: .leading, spacing: 40) {
+                            Spacer(minLength: 40) // 把首屏内容推到底部
                             
-                            Menu {
-                                ForEach(subjectCollectionMenuOptions, id: \.rawValue) { option in
-                                    Button {
-                                        handleSubjectCollectionMenuSelection(option)
-                                    } label: {
-                                        Label(option.title, systemImage: option.systemImage)
+                            // A. 顶部元信息区 (标题 + 简介)
+                            HStack(alignment: .bottom, spacing: 60) {
+                                VStack(alignment: .leading, spacing: 20) {
+                                    // 1. 标题 (优先展示 Logo，回退展示文字)
+                                    Group {
+                                        switch titleDisplayMode {
+                                        case .chineseLogo(let url, let aspect), .originalLogo(let url, let aspect):
+                                            KFImage(url)
+                                                .resizable()
+                                                .placeholder {
+                                                    Text(displayName)
+                                                        .font(.system(size: 60, weight: .heavy, design: .rounded))
+                                                        .shadow(radius: 10)
+                                                }
+                                                .aspectRatio(aspect, contentMode: .fit)
+                                                .frame(maxHeight: 120, alignment: .leading)
+                                                .shadow(color: .black.opacity(0.8), radius: 10, x: 0, y: 5)
+                                        case .text(let title):
+                                            Text(title)
+                                                .font(.system(size: 60, weight: .heavy, design: .rounded))
+                                                .shadow(radius: 10)
+                                        }
                                     }
-                                }
-                            } label: {
-                                Label(subjectCollectionButtonTitle, systemImage: subjectCollectionButtonSystemImage)
-                            }
-                        }
-                    }.focusScope(focusNamespace)
-                }
-//                .padding(.horizontal, 80) // tvOS 两侧留白通常较大
-                
-                // B. 底部剧集列表 (Shelf)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("剧集列表")
-                        .font(.title3)
-                        .fontWeight(.bold)
-                        .offset(y: isShelfTitleLifted ? -16 : 0)
-                        .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.82), value: isShelfTitleLifted)
-//                        .padding(.horizontal, 80)
-
-                    ScrollViewReader { scrollProxy in
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 40) {
-                                if isEpisodesLoading && episodes.isEmpty {
-                                    ForEach(0..<6, id: \.self) { _ in
-                                        EpisodeSkeletonCardView()
-                                    }
-                                } else {
-                                    ForEach(episodes, id: \.id) { episode in
-                                        EpisodeCardView(
-                                            episodeInfo: episode,
-                                            sessionTitle: displayName,
-                                            stillURL: episodeStills[episode.id],
-                                            isWatched: effectiveIsWatched(for: episode),
-                                            onOpenPlayer: {
-                                                handleEpisodeCardTap(episode)
-                                            },
-                                            onToggleWatched: {
-                                                handleEpisodeWatchToggle(episode)
+                                    
+                                    // 2. 标签行 (年份 | 评分 | 类型)
+                                    HStack(spacing: 20) {
+                                        if let starts = startDate {
+                                            var dateString: String {
+                                                let formatter = DateFormatter()
+                                                formatter.dateFormat = "yyyy年M月"
+                                                return formatter.string(from: starts)
                                             }
-                                        )
-                                        .id(episode.id)
-                                        .focused($focusedEpisodeID, equals: episode.id)
+                                            BadgeView(text: dateString)
+                                        }
+                                        BadgeView(text: typeText.uppercased())
+                                        if !secondaryTitleText.isEmpty {
+                                            Text(secondaryTitleText)
+                                        }
+                                    }
+                                    
+                                    ScoreView(
+                                        score: score,
+                                        count: count,
+                                        rank: rank
+                                    )
+                                    // 给评分和下方的标签加点间距
+                                    .padding(.bottom, 10)
+                                    
+                                    // 3. 简介 (限制行数，白字，focus后黑字白底)
+                                    Button(action: { self.showingFullInfo = true }) {
+                                        Text(infoText)
+                                            .font(.body)
+                                            .foregroundColor(isDescriptionFocused ? .black : .white)
+                                            .lineLimit(3)
+                                            .frame(maxWidth: 900, alignment: .leading)
+                                            .background(
+                                                isDescriptionFocused ? Color.white : Color.clear,
+                                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .focused($focusedField, equals: "description")
+                                    .animation(.easeInOut(duration: 0.18), value: isDescriptionFocused)
+                                    
+                                    // 4. 操作按钮组
+                                    HStack(spacing: 20) {
+                                        Button(action: handlePlayButtonTap) {
+                                            Label(playButtonTitle, systemImage: "play.fill")
+                                                .padding(.horizontal, 20)
+                                                .padding(.vertical, 10)
+                                        }
+                                        // 2. 修正这里：参数是 (true, in: namespace)
+                                        .prefersDefaultFocus(true, in: focusNamespace)
+                                        .focused($focusedField, equals: "playButton")
+                                        
+                                        Menu {
+                                            ForEach(subjectCollectionMenuOptions, id: \.rawValue) { option in
+                                                Button {
+                                                    handleSubjectCollectionMenuSelection(option)
+                                                } label: {
+                                                    Label(option.title, systemImage: option.systemImage)
+                                                }
+                                            }
+                                        } label: {
+                                            Label(subjectCollectionButtonTitle, systemImage: subjectCollectionButtonSystemImage)
+                                        }
+                                    }
+                                }.focusScope(focusNamespace)
+                            }
+                            
+                            // B. 底部剧集列表 (Shelf)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("剧集列表")
+                                    .font(.title3)
+                                    .fontWeight(.bold)
+                                    .offset(y: isShelfTitleLifted ? -16 : 0)
+                                    .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.82), value: isShelfTitleLifted)
+
+                                ScrollViewReader { scrollProxy in
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 40) {
+                                            if isEpisodesLoading && episodes.isEmpty {
+                                                ForEach(0..<6, id: \.self) { _ in
+                                                    EpisodeSkeletonCardView()
+                                                }
+                                            } else {
+                                                ForEach(episodes, id: \.id) { episode in
+                                                    EpisodeCardView(
+                                                        episodeInfo: episode,
+                                                        sessionTitle: displayName,
+                                                        stillURL: episodeStills[episode.id],
+                                                        isWatched: effectiveIsWatched(for: episode),
+                                                        onOpenPlayer: {
+                                                            handleEpisodeCardTap(episode)
+                                                        },
+                                                        onToggleWatched: {
+                                                            handleEpisodeWatchToggle(episode)
+                                                        }
+                                                    )
+                                                    .id(episode.id)
+                                                    .focused($focusedEpisodeID, equals: episode.id)
+                                                }
+                                            }
+                                        }
+                                        .padding(.top, 22)
+                                        .padding(.bottom, 50)
+                                        .scrollTargetLayout()
+                                    }
+                                    .scrollPosition(id: $scrolledEpisodeID)
+                                    .frame(height: 320)
+                                    .onChange(of: scrolledEpisodeID) { _, newScrolledID in
+                                        guard let newScrolledID else { return }
+                                        manualLeadingEpisodeID = newScrolledID
+                                        updateTitleLiftState(for: focusedEpisodeID)
+                                    }
+                                    .onChange(of: focusedEpisodeID) { _, newID in
+                                        updateTitleLiftState(for: newID)
+                                    }
+                                    .onChange(of: firstUnwatchedEpisode?.id) { _, episodeID in
+                                        guard let episodeID else { return }
+                                        withAnimation(.easeInOut(duration: 0.25)) {
+                                            scrollProxy.scrollTo(episodeID, anchor: .leading)
+                                        }
+                                    }
+                                    .onAppear {
+                                        guard let episodeID = firstUnwatchedEpisode?.id else { return }
+                                        DispatchQueue.main.async {
+                                            scrollProxy.scrollTo(episodeID, anchor: .leading)
+                                        }
                                     }
                                 }
                             }
-                            .padding(.top, 22)
-                            .padding(.bottom, 50)
-                            .scrollTargetLayout()
+                            .focusSection()
                         }
-                        .scrollPosition(id: $scrolledEpisodeID)
-                        .frame(height: 320)
-                        .onChange(of: scrolledEpisodeID) { _, newScrolledID in
-                            guard let newScrolledID else { return }
-                            manualLeadingEpisodeID = newScrolledID
-                            updateTitleLiftState(for: focusedEpisodeID)
-                        }
-                        .onChange(of: focusedEpisodeID) { _, newID in
-                            updateTitleLiftState(for: newID)
-                        }
-                        .onChange(of: firstUnwatchedEpisode?.id) { _, episodeID in
-                            guard let episodeID else { return }
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                scrollProxy.scrollTo(episodeID, anchor: .leading)
+                        .frame(minHeight: screenProxy.size.height, alignment: .bottomLeading)
+
+                        // C. 角色与声优 (演职员)
+                        if !characters.isEmpty {
+                            VStack(alignment: .leading, spacing: 18) {
+                                Text("角色与声优")
+                                    .font(.title3)
+                                    .fontWeight(.bold)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 32) {
+                                        ForEach(characters.prefix(30)) { character in
+                                            DetailCharacterCardView(character: character)
+                                        }
+                                    }
+                                    .padding(.vertical, 14)
+                                }
                             }
+                            .focusSection()
                         }
-                        .onAppear {
-                            guard let episodeID = firstUnwatchedEpisode?.id else { return }
-                            DispatchQueue.main.async {
-                                scrollProxy.scrollTo(episodeID, anchor: .leading)
+
+                        // D. 制作人员 (Staff)
+                        if !persons.isEmpty {
+                            VStack(alignment: .leading, spacing: 18) {
+                                Text("制作人员")
+                                    .font(.title3)
+                                    .fontWeight(.bold)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 28) {
+                                        ForEach(dedupedPersons.prefix(30), id: \.uniqueKey) { person in
+                                            DetailStaffCardView(person: person)
+                                        }
+                                    }
+                                    .padding(.vertical, 14)
+                                }
                             }
+                            .focusSection()
+                        }
+
+                        // E. 番剧吐槽
+                        if !comments.isEmpty {
+                            VStack(alignment: .leading, spacing: 18) {
+                                HStack(alignment: .firstTextBaseline, spacing: 14) {
+                                    Text("番剧吐槽")
+                                        .font(.title3)
+                                        .fontWeight(.bold)
+
+                                    if commentsTotal > 0 {
+                                        Text("\(commentsTotal) 条评价")
+                                            .font(.callout)
+                                            .foregroundStyle(.white.opacity(0.6))
+                                    }
+                                }
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 30) {
+                                        ForEach(comments) { item in
+                                            DetailCommentCardView(comment: item) {
+                                                selectedCommentForSheet = item
+                                            }
+                                        }
+
+                                        if comments.count < commentsTotal {
+                                            Button {
+                                                Task {
+                                                    await loadMoreComments()
+                                                }
+                                            } label: {
+                                                VStack(spacing: 12) {
+                                                    if isLoadingMoreComments {
+                                                        ProgressView()
+                                                            .tint(.white)
+                                                    } else {
+                                                        Image(systemName: "ellipsis.circle")
+                                                            .font(.system(size: 36, weight: .semibold))
+                                                        Text("加载更多吐槽")
+                                                            .font(.headline)
+                                                    }
+                                                }
+                                                .foregroundStyle(.white.opacity(0.85))
+                                                .frame(width: 240, height: 228)
+                                                .background(Color.white.opacity(0.1))
+                                                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                                            }
+                                            .buttonStyle(.card)
+                                        }
+                                    }
+                                    .padding(.vertical, 16)
+                                }
+                            }
+                            .focusSection()
                         }
                     }
+                    .padding(.bottom, 80)
                 }
-                .focusSection()
             }
         }
         .onAppear {
@@ -272,31 +377,29 @@ struct AnimeDetailView: View {
             }
             .padding(60)
         }
+        .sheet(item: $selectedCommentForSheet) { comment in
+            DetailCommentReaderSheet(comment: comment) {
+                selectedCommentForSheet = nil
+            }
+        }
         .confirmationDialog(
             "检测到本地播放记录",
-            isPresented: Binding(
-                get: { pendingResumePromptEpisode != nil },
-                set: { isPresented in
-                    if !isPresented {
-                        pendingResumePromptEpisode = nil
-                        pendingResumePromptSeconds = 0
-                    }
-                }
-            ),
+            isPresented: $showingResumePrompt,
             titleVisibility: .visible
         ) {
             Button("续播") {
                 guard let episode = pendingResumePromptEpisode else { return }
-                openEpisodePlayer(episodes, episode, displayName, pendingResumePromptSeconds)
+                let resumeSeconds = pendingResumePromptSeconds
                 pendingResumePromptEpisode = nil
                 pendingResumePromptSeconds = 0
+                openEpisodePlayer(episodes, episode, displayName, resumeSeconds > 0 ? resumeSeconds : nil)
             }
 
             Button("从头开始") {
                 guard let episode = pendingResumePromptEpisode else { return }
-                openEpisodePlayer(episodes, episode, displayName, nil)
                 pendingResumePromptEpisode = nil
                 pendingResumePromptSeconds = 0
+                openEpisodePlayer(episodes, episode, displayName, nil)
             }
 
             Button("取消", role: .cancel) {
@@ -589,6 +692,32 @@ struct AnimeDetailView: View {
             print("Failed to load episodes: \(error)")
         }
 
+        // 异步并发拉取演职员与吐槽箱
+        Task {
+            async let charactersTask = try? bgmRepo.getSubjectCharacters(subjectID: bgmId)
+            async let personsTask = try? bgmRepo.getSubjectPersons(subjectID: bgmId)
+            async let commentsTask = try? bgmRepo.getSubjectComments(subjectID: bgmId, limit: 20, offset: 0)
+
+            let (fetchedCharacters, fetchedPersons, fetchedComments) = await (
+                charactersTask,
+                personsTask,
+                commentsTask
+            )
+
+            await MainActor.run {
+                if let fetchedCharacters {
+                    self.characters = fetchedCharacters
+                }
+                if let fetchedPersons {
+                    self.persons = fetchedPersons
+                }
+                if let fetchedComments {
+                    self.comments = fetchedComments.data.filter { !$0.comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                    self.commentsTotal = fetchedComments.total
+                }
+            }
+        }
+
         if let profile = authenticatedProfile,
            profile.isAuthenticated,
            let bgmUserID = profile.effectiveBgmUserID {
@@ -673,6 +802,7 @@ struct AnimeDetailView: View {
             }
             pendingResumePromptEpisode = episode
             pendingResumePromptSeconds = resumeSeconds
+            showingResumePrompt = true
         }
     }
 
@@ -692,6 +822,7 @@ struct AnimeDetailView: View {
             }
             pendingResumePromptEpisode = episode
             pendingResumePromptSeconds = resumeSeconds
+            showingResumePrompt = true
         }
     }
 
@@ -857,6 +988,281 @@ struct AnimeDetailView: View {
         return watchedEpisodeIDs.contains(episode.id)
     }
 
+    private var dedupedPersons: [BgmRelatedPersonDTO] {
+        var seen = Set<String>()
+        return persons.filter { seen.insert($0.uniqueKey).inserted }
+    }
+
+    private func loadMoreComments() async {
+        guard !isLoadingMoreComments, comments.count < commentsTotal else { return }
+        isLoadingMoreComments = true
+        defer { isLoadingMoreComments = false }
+
+        do {
+            let response = try await BangumiRepository().getSubjectComments(
+                subjectID: bgmId,
+                limit: 20,
+                offset: comments.count
+            )
+            let filtered = response.data.filter { !$0.comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            await MainActor.run {
+                var existing = Set(comments.map(\.id))
+                for item in filtered where existing.insert(item.id).inserted {
+                    comments.append(item)
+                }
+                commentsTotal = max(commentsTotal, response.total)
+            }
+        } catch {
+            print("Failed to load more comments: \(error)")
+        }
+    }
+
+}
+
+// MARK: - Cast, Staff & Comments Cards
+
+private struct DetailCharacterCardView: View {
+    let character: BgmRelatedCharacterDTO
+
+    var body: some View {
+        Button(action: {}) {
+            VStack(alignment: .leading, spacing: 0) {
+                Color.white.opacity(0.08)
+                    .frame(width: 200, height: 240)
+                    .overlay(alignment: .top) {
+                        KFImage(character.images?.preferredURL)
+                            .placeholder {
+                                ZStack {
+                                    Color.white.opacity(0.1)
+                                    Image(systemName: "person.fill")
+                                        .font(.title)
+                                        .foregroundStyle(.white.opacity(0.35))
+                                }
+                                .frame(width: 200, height: 240)
+                            }
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 200, height: 240, alignment: .top)
+                    }
+                    .clipped()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(character.name)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+
+                    if let cv = character.primaryActorName, !cv.isEmpty {
+                        Text("CV: \(cv)")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .lineLimit(1)
+                    } else if !character.relation.isEmpty {
+                        Text(character.relation)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.6))
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(width: 200, alignment: .leading)
+                .background(.ultraThinMaterial)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.card)
+        .frame(width: 200)
+    }
+}
+
+private struct DetailStaffCardView: View {
+    let person: BgmRelatedPersonDTO
+
+    var body: some View {
+        Button(action: {}) {
+            HStack(spacing: 14) {
+                Color.white.opacity(0.12)
+                    .frame(width: 68, height: 68)
+                    .overlay(alignment: .top) {
+                        KFImage(person.images?.preferredURL)
+                            .placeholder {
+                                ZStack {
+                                    Color.white.opacity(0.12)
+                                    Image(systemName: "person.crop.circle")
+                                        .font(.title2)
+                                        .foregroundStyle(.white.opacity(0.45))
+                                }
+                                .frame(width: 68, height: 68)
+                            }
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 68, height: 68, alignment: .top)
+                    }
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(person.name)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+
+                    if !person.relation.isEmpty {
+                        Text(person.relation)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.68))
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(width: 300, height: 96, alignment: .leading)
+            .background(Color.white.opacity(0.1))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+        .buttonStyle(.card)
+        .frame(width: 300)
+    }
+}
+
+private struct DetailCommentCardView: View {
+    let comment: BgmSubjectCommentDTO
+    let action: () -> Void
+
+    private var dateText: String {
+        guard comment.updatedAt > 0 else { return "" }
+        let date = Date(timeIntervalSince1970: TimeInterval(comment.updatedAt))
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    KFImage(comment.user.avatar?.preferredURL)
+                        .resizable()
+                        .placeholder {
+                            Image(systemName: "person.crop.circle.fill")
+                                .resizable()
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 40, height: 40)
+                        .clipShape(Circle())
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(comment.user.displayName)
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+
+                        HStack(spacing: 8) {
+                            if !comment.collectionLabel.isEmpty {
+                                Text(comment.collectionLabel)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.white.opacity(0.75))
+                            }
+                            if !dateText.isEmpty {
+                                Text(dateText)
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+                        }
+                    }
+
+                    Spacer(minLength: 4)
+
+                    if comment.rate > 0 {
+                        HStack(spacing: 4) {
+                            Image(systemName: "star.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.yellow)
+                            Text("\(comment.rate)")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.white.opacity(0.14)))
+                    }
+                }
+
+                Text(comment.comment)
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.88))
+                    .lineLimit(4)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+            .frame(width: 460, height: 228, alignment: .topLeading)
+            .background(Color.white.opacity(0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .buttonStyle(.card)
+        .frame(width: 460)
+    }
+}
+
+private struct DetailCommentReaderSheet: View {
+    let comment: BgmSubjectCommentDTO
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(spacing: 16) {
+                KFImage(comment.user.avatar?.preferredURL)
+                    .resizable()
+                    .placeholder {
+                        Image(systemName: "person.crop.circle.fill")
+                            .resizable()
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 56, height: 56)
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(comment.user.displayName)
+                        .font(.title3.weight(.bold))
+                    if !comment.collectionLabel.isEmpty {
+                        Text(comment.collectionLabel)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                if comment.rate > 0 {
+                    Label("\(comment.rate) / 10", systemImage: "star.fill")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(.yellow)
+                }
+            }
+
+            ScrollView {
+                Text(comment.comment)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack {
+                Spacer()
+                Button("关闭", action: onClose)
+                    .buttonStyle(.borderedProminent)
+                Spacer()
+            }
+        }
+        .padding(60)
+    }
 }
 
 // 辅助小组件：标签

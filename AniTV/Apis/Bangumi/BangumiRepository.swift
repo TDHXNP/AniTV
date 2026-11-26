@@ -362,6 +362,134 @@ struct BangumiRepository {
         )
     }
 
+    /// 搜索动画条目
+    /// POST /v0/search/subjects
+    func searchSubjects(
+        keyword: String,
+        sort: String = "match",
+        subjectTypes: [Int] = [2],
+        limit: Int = 24,
+        offset: Int = 0
+    ) async throws -> BgmPagedResponse<BgmSearchSubjectDTO> {
+        struct SearchFilter: Encodable {
+            let type: [Int]
+        }
+        struct SearchRequestBody: Encodable {
+            let keyword: String
+            let sort: String
+            let filter: SearchFilter
+        }
+
+        let payload = SearchRequestBody(
+            keyword: keyword,
+            sort: sort,
+            filter: SearchFilter(type: subjectTypes)
+        )
+
+        return try await client.request(
+            BgmPagedResponse<BgmSearchSubjectDTO>.self,
+            method: "POST",
+            url: BangumiAPI.pub.build("v0/search/subjects"),
+            queryItems: [
+                URLQueryItem(name: "limit", value: String(limit)),
+                URLQueryItem(name: "offset", value: String(offset))
+            ],
+            headers: jsonHeaders(),
+            body: try JSONEncoder().encode(payload)
+        )
+    }
+
+    /// 动画排行榜 / 多维筛选
+    /// POST /v0/search/subjects
+    func fetchRankingSubjects(
+        sort: String = "rank",
+        metaTags: [String] = [],
+        airDateConditions: [String] = [],
+        limit: Int = 24,
+        offset: Int = 0
+    ) async throws -> BgmPagedResponse<BgmSearchSubjectDTO> {
+        struct RankingFilter: Encodable {
+            let type: [Int]
+            let metaTags: [String]?
+            let airDate: [String]?
+            let nsfw: Bool
+
+            enum CodingKeys: String, CodingKey {
+                case type
+                case metaTags = "meta_tags"
+                case airDate = "air_date"
+                case nsfw
+            }
+        }
+        struct RankingRequestBody: Encodable {
+            let keyword: String
+            let sort: String
+            let filter: RankingFilter
+        }
+
+        let cleanMetaTags = metaTags
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let cleanAirDates = airDateConditions
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let payload = RankingRequestBody(
+            keyword: "",
+            sort: sort,
+            filter: RankingFilter(
+                type: [2],
+                metaTags: cleanMetaTags.isEmpty ? nil : cleanMetaTags,
+                airDate: cleanAirDates.isEmpty ? nil : cleanAirDates,
+                nsfw: false
+            )
+        )
+
+        return try await client.request(
+            BgmPagedResponse<BgmSearchSubjectDTO>.self,
+            method: "POST",
+            url: BangumiAPI.pub.build("v0/search/subjects"),
+            queryItems: [
+                URLQueryItem(name: "limit", value: String(limit)),
+                URLQueryItem(name: "offset", value: String(offset))
+            ],
+            headers: jsonHeaders(),
+            body: try JSONEncoder().encode(payload)
+        )
+    }
+
+    /// 获取条目角色与声优
+    /// GET /v0/subjects/{subjectID}/characters
+    func getSubjectCharacters(subjectID: Int) async throws -> [BgmRelatedCharacterDTO] {
+        try await client.request(
+            url: BangumiAPI.pub.build("v0/subjects/\(subjectID)/characters")
+        )
+    }
+
+    /// 获取条目制作人员
+    /// GET /v0/subjects/{subjectID}/persons
+    func getSubjectPersons(subjectID: Int) async throws -> [BgmRelatedPersonDTO] {
+        try await client.request(
+            url: BangumiAPI.pub.build("v0/subjects/\(subjectID)/persons")
+        )
+    }
+
+    /// 获取条目吐槽箱评论
+    /// GET https://next.bgm.tv/p1/subjects/{subjectID}/comments
+    func getSubjectComments(
+        subjectID: Int,
+        limit: Int = 20,
+        offset: Int = 0
+    ) async throws -> BgmPagedResponse<BgmSubjectCommentDTO> {
+        try await client.request(
+            url: BangumiAPI.priv.build("p1/subjects/\(subjectID)/comments"),
+            queryItems: [
+                URLQueryItem(name: "limit", value: String(limit)),
+                URLQueryItem(name: "offset", value: String(offset))
+            ]
+        )
+    }
+
     func fetchLargeImages(subjectIDs: [Int]) async throws -> [Int: String] {
         guard !subjectIDs.isEmpty else { return [:] }
 
