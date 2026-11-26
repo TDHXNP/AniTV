@@ -128,6 +128,13 @@ private final class CollectionContentStore: ObservableObject {
         await loadPage(for: tab, reset: true, database: database)
     }
 
+    func reloadForProfileChange(database: any DatabaseWriter) async {
+        profile = nil
+        pageStates = [:]
+        await ensureProfileLoaded(database: database)
+        await loadPage(for: selectedTab, reset: true, database: database)
+    }
+
     func loadMoreIfNeeded(for tab: CollectionTab, currentItem: HomePosterItem, database: any DatabaseWriter) async {
         let currentState = state(for: tab)
         guard currentItem.id == currentState.items.last?.id else { return }
@@ -271,6 +278,11 @@ struct CollectionView: View {
             }
         }
         .background(Color.black.ignoresSafeArea())
+        .onReceive(NotificationCenter.default.publisher(for: .userProfileDidChange)) { _ in
+            Task {
+                await store.reloadForProfileChange(database: database)
+            }
+        }
     }
 }
 

@@ -71,12 +71,24 @@ struct TMDBRepository {
             return ""
         }
 
-        guard let url = URL(string: "\(TMDBConfig.baseURL)/\(normalizedTMDBID)/images?api_key=\(apiKey)") else {
-            return ""
+        let request: URLRequest
+        if apiKey.contains(".") {
+            guard let url = URL(string: "\(TMDBConfig.baseURL)/\(normalizedTMDBID)/images") else {
+                return ""
+            }
+            var req = URLRequest(url: url)
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            request = req
+        } else {
+            guard let url = URL(string: "\(TMDBConfig.baseURL)/\(normalizedTMDBID)/images?api_key=\(apiKey)") else {
+                return ""
+            }
+            request = URLRequest(url: url)
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 return ""
             }

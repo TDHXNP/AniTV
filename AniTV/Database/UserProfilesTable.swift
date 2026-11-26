@@ -92,9 +92,6 @@ extension AniTVDatabase {
             try db.execute(sql: "DELETE FROM user_profiles")
         }
         _ = try await insertGuestUserProfile(in: database)
-        await MainActor.run {
-            NotificationCenter.default.post(name: .userProfileDidChange, object: nil)
-        }
     }
 
     static func insertGuestUserProfile(in database: any DatabaseWriter) async throws -> UserProfile {

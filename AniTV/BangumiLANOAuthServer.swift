@@ -20,21 +20,39 @@ final class BangumiLANOAuthServer: NSObject {
     private let config: Config
     private let queue = DispatchQueue(label: "xyz.moyuwang.AniTV.lan-oauth")
     private let onStatusChange: @Sendable (String) -> Void
-    private let onAuthorizationCode: @Sendable (String) -> Void
+    private let onAuthorizationCode: @Sendable (String, String) -> Void
 
     private var listener: NWListener?
-    private var pendingSession: PendingSession?
+    private var pendingSessions: [String: PendingSession] = [:]
+    private let stateLock = NSLock()
+    private var _isRunning = false
+
+    private static let pendingSessionTTL: TimeInterval = 15 * 60
+    private static let maxPendingSessions = 20
 
     private struct PendingSession {
         let sessionID: String
         let nonce: String
         let state: String
+        let createdAt: Date
+    }
+
+    var isRunning: Bool {
+        stateLock.withLock { _isRunning }
+    }
+
+    var localEndpoint: String {
+        config.localEndpoint
+    }
+
+    var redirectURI: String {
+        config.redirectURI
     }
 
     init(
         config: Config,
         onStatusChange: @escaping @Sendable (String) -> Void,
-        onAuthorizationCode: @escaping @Sendable (String) -> Void
+        onAuthorizationCode: @escaping @Sendable (String, String) -> Void
     ) {
         self.config = config
         self.onStatusChange = onStatusChange
@@ -43,8 +61,35 @@ final class BangumiLANOAuthServer: NSObject {
     }
 
     func start() {
+        queue.async { [weak self] in
+            self?.startOnQueue()
+        }
+    }
+
+    func stop() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.listener?.stateUpdateHandler = nil
+            self.listener?.newConnectionHandler = nil
+            self.listener?.cancel()
+            self.listener = nil
+            self.setRunning(false)
+        }
+    }
+
+    private func setRunning(_ running: Bool) {
+        stateLock.withLock { _isRunning = running }
+    }
+
+    private func startOnQueue() {
+        listener?.stateUpdateHandler = nil
+        listener?.newConnectionHandler = nil
+        listener?.cancel()
+        listener = nil
+
         do {
             let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
             let listener = try NWListener(using: parameters, on: NWEndpoint.Port(integerLiteral: config.port))
             self.listener = listener
 
@@ -52,10 +97,13 @@ final class BangumiLANOAuthServer: NSObject {
                 guard let self else { return }
                 switch state {
                 case .ready:
+                    self.setRunning(true)
                     self.onStatusChange("局域网登录服务已启动：\(self.config.localEndpoint)")
                 case .failed(let error):
+                    self.setRunning(false)
                     self.onStatusChange("局域网登录服务启动失败：\(error.localizedDescription)")
                 case .cancelled:
+                    self.setRunning(false)
                     self.onStatusChange("局域网登录服务已停止。")
                 default:
                     break
@@ -68,6 +116,7 @@ final class BangumiLANOAuthServer: NSObject {
 
             listener.start(queue: queue)
         } catch {
+            setRunning(false)
             onStatusChange("局域网登录服务启动失败：\(error.localizedDescription)")
         }
     }
@@ -132,7 +181,30 @@ final class BangumiLANOAuthServer: NSObject {
         }
     }
 
+    private func pruneExpiredPendingSessions(now: Date = Date()) {
+        pendingSessions = pendingSessions.filter { _, session in
+            now.timeIntervalSince(session.createdAt) <= Self.pendingSessionTTL
+        }
+        if pendingSessions.count > Self.maxPendingSessions {
+            let sortedKeys = pendingSessions
+                .sorted { $0.value.createdAt < $1.value.createdAt }
+                .prefix(pendingSessions.count - Self.maxPendingSessions)
+                .map(\.key)
+            for key in sortedKeys {
+                pendingSessions.removeValue(forKey: key)
+            }
+        }
+    }
+
     private func handleStart() -> Data {
+        guard !config.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return htmlResponse(
+                status: "500 Internal Server Error",
+                body: "<html><body style=\"font-family:-apple-system;padding:24px;background:#111;color:#fff;\"><h1>Bangumi 配置缺失</h1><p>当前应用未配置 Bangumi OAuth client_id 或 client_secret。</p></body></html>"
+            )
+        }
+
         let sessionID = UUID().uuidString
         let nonce = UUID().uuidString
 
@@ -147,7 +219,14 @@ final class BangumiLANOAuthServer: NSObject {
             )
         }
 
-        pendingSession = PendingSession(sessionID: sessionID, nonce: nonce, state: state)
+        let now = Date()
+        pruneExpiredPendingSessions(now: now)
+        pendingSessions[state] = PendingSession(
+            sessionID: sessionID,
+            nonce: nonce,
+            state: state,
+            createdAt: now
+        )
 
         guard !config.redirectURI.isEmpty else {
             return htmlResponse(
@@ -167,6 +246,8 @@ final class BangumiLANOAuthServer: NSObject {
             )
         }
 
+        let escapedAuthURL = authorizationURL.absoluteString.replacingOccurrences(of: "&", with: "&amp;")
+
         return htmlResponse(
             status: "200 OK",
             body: """
@@ -185,7 +266,7 @@ final class BangumiLANOAuthServer: NSObject {
             <h1>连接 Bangumi 到 AniTV</h1>
             <p>点击下面的按钮后，会跳转到 Bangumi 官方授权页；如果授权后电视没有响应，请扫码重试或使用Apple设备登录按钮登录。</p>
             <p>建议使用原生相机App扫码打开或在默认浏览器中打开</p>
-            <a class="button" href="\(authorizationURL.absoluteString)">继续前往 Bangumi 登录</a>
+            <a class="button" href="\(escapedAuthURL)">继续前往 Bangumi 登录</a>
             </div>
             </body>
             </html>
@@ -204,17 +285,19 @@ final class BangumiLANOAuthServer: NSObject {
             )
         }
 
-        guard let pendingSession, pendingSession.state == returnedState else {
+        pruneExpiredPendingSessions()
+        guard let returnedState,
+              pendingSessions.removeValue(forKey: returnedState) != nil else {
             return htmlResponse(
                 status: "400 Bad Request",
                 body: "<html><body>Bangumi callback state mismatch.</body></html>"
             )
         }
 
-        self.pendingSession = nil
         let stableCode = String(code)
+        let stableRedirectURI = String(config.redirectURI)
 
-        onAuthorizationCode(stableCode)
+        onAuthorizationCode(stableCode, stableRedirectURI)
 
         return htmlResponse(
             status: "200 OK",
@@ -248,7 +331,8 @@ final class BangumiLANOAuthServer: NSObject {
             )
         }
 
-        guard let pendingSession else {
+        pruneExpiredPendingSessions()
+        guard !pendingSessions.isEmpty else {
             return htmlResponse(
                 status: "409 Conflict",
                 body: """
@@ -260,7 +344,7 @@ final class BangumiLANOAuthServer: NSObject {
             )
         }
 
-        guard state == pendingSession.state,
+        guard let pendingSession = pendingSessions[state],
               sessionID == pendingSession.sessionID,
               nonce == pendingSession.nonce else {
             return htmlResponse(
@@ -274,10 +358,11 @@ final class BangumiLANOAuthServer: NSObject {
             )
         }
 
-        self.pendingSession = nil
+        pendingSessions.removeValue(forKey: state)
         let stableCode = String(code)
+        let stableRedirectURI = String(config.redirectURI)
 
-        onAuthorizationCode(stableCode)
+        onAuthorizationCode(stableCode, stableRedirectURI)
 
         return htmlResponse(
             status: "200 OK",

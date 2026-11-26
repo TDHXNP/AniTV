@@ -214,12 +214,24 @@ actor TMDBEpisodeStillRepository {
     }
 
     private func fetchSeasonStills(seriesId: Int, season: Int, apiKey: String) async -> [Int: String]? {
-        guard let url = URL(string: "\(tmdbBaseURL)/tv/\(seriesId)/season/\(season)?api_key=\(apiKey)&language=zh-CN") else {
-            return nil
+        let request: URLRequest
+        if apiKey.contains(".") {
+            guard let url = URL(string: "\(tmdbBaseURL)/tv/\(seriesId)/season/\(season)?language=zh-CN") else {
+                return nil
+            }
+            var req = URLRequest(url: url)
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            request = req
+        } else {
+            guard let url = URL(string: "\(tmdbBaseURL)/tv/\(seriesId)/season/\(season)?api_key=\(apiKey)&language=zh-CN") else {
+                return nil
+            }
+            request = URLRequest(url: url)
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 return nil
             }

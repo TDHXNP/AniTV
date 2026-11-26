@@ -15,7 +15,20 @@ struct OOBEProfileSetupView: View {
     let lanServiceStatus: String
     let createGuestAction: () -> Void
     let connectBangumiAction: () -> Void
+    var onAppearAction: (() -> Void)? = nil
     var onDismiss: (() -> Void)? = nil
+
+    private var shouldShowStatusBanner: Bool {
+        if isAuthenticating {
+            return true
+        }
+        let trimmed = statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "尚未登录 Bangumi。"
+    }
+
+    private var isFailureStatus: Bool {
+        statusMessage.contains("失败") || statusMessage.contains("失效") || statusMessage.contains("请先填写") || statusMessage.contains("无法") || statusMessage.contains("没有")
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -38,6 +51,9 @@ struct OOBEProfileSetupView: View {
                 .padding(.horizontal, 76)
                 .padding(.top, proxy.size.height * 0.105)
             }
+        }
+        .onAppear {
+            onAppearAction?()
         }
         .onExitCommand {
             onDismiss?()
@@ -63,11 +79,39 @@ struct OOBEProfileSetupView: View {
                     .foregroundStyle(.white.opacity(0.92))
                     .lineSpacing(-2)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if shouldShowStatusBanner {
+                    HStack(spacing: 12) {
+                        if isAuthenticating {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: isFailureStatus ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                .foregroundStyle(isFailureStatus ? Color.orange : Color.green)
+                        }
+
+                        Text(statusMessage)
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(isFailureStatus ? Color.orange.opacity(0.18) : Color.white.opacity(0.12))
+                    )
+                    .padding(.top, 24)
+                }
             }
+
+            Spacer(minLength: 32)
 
             VStack(alignment: .leading, spacing: 18) {
                 OOBEActionButton(
-                    title: "用 Apple 设备登录",
+                    title: isAuthenticating ? "正在登录 Bangumi…" : "用 Apple 设备登录",
                     systemImage: "ipad.landscape.and.iphone",
                     action: connectBangumiAction
                 )
@@ -82,9 +126,9 @@ struct OOBEProfileSetupView: View {
                 .disabled(isAuthenticating)
                 .frame(width: 420)
             }
-            .padding(.top, 270)
+            .padding(.bottom, 90)
         }
-        .frame(maxWidth: maxWidth, alignment: .leading)
+        .frame(maxWidth: maxWidth, maxHeight: .infinity, alignment: .topLeading)
     }
 
     @ViewBuilder
@@ -104,6 +148,13 @@ struct OOBEProfileSetupView: View {
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
                     .minimumScaleFactor(0.62)
+
+                if lanEntryURL.isEmpty, !lanServiceStatus.isEmpty {
+                    Text(lanServiceStatus)
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.62))
+                        .multilineTextAlignment(.center)
+                }
             }
             .padding(.top, 54)
             .padding(.horizontal, 20)

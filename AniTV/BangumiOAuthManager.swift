@@ -29,24 +29,51 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
 
     private var authenticationSession: ASWebAuthenticationSession?
     private var lanOAuthServer: BangumiLANOAuthServer?
+    private var database: DatabaseQueue?
 
     override init() {
         super.init()
+        ensureLANServerRunning()
+    }
+
+    func configure(database: DatabaseQueue) {
+        self.database = database
+    }
+
+    func ensureLANServerRunning() {
+        let resolvedEntryURL: String
+        let resolvedRedirectURI: String
         if let lanIPv4Address = Self.resolveLANIPv4Address() {
-            lanEntryURL = "http://\(lanIPv4Address):8437/oauth/bangumi/start"
-            lanRedirectURI = "http://\(lanIPv4Address):8437/oauth/bangumi"
+            resolvedEntryURL = "http://\(lanIPv4Address):8437/oauth/bangumi/start"
+            resolvedRedirectURI = "http://\(lanIPv4Address):8437/oauth/bangumi"
         } else {
-            lanEntryURL = ""
-            lanRedirectURI = ""
+            resolvedEntryURL = ""
+            resolvedRedirectURI = ""
             lanServiceStatus = "未能解析当前电视的局域网 IPv4 地址，二维码入口暂不可用。"
         }
 
-        let localEndpoint = lanEntryURL.replacingOccurrences(of: "/oauth/bangumi/start", with: "")
+        let localEndpoint = resolvedEntryURL.replacingOccurrences(of: "/oauth/bangumi/start", with: "")
+        let needsRestart =
+            lanOAuthServer == nil ||
+            lanOAuthServer?.isRunning != true ||
+            lanEntryURL != resolvedEntryURL ||
+            lanRedirectURI != resolvedRedirectURI
+
+        lanEntryURL = resolvedEntryURL
+        lanRedirectURI = resolvedRedirectURI
+
+        guard needsRestart else { return }
+
+        lanOAuthServer?.stop()
+        lanOAuthServer = nil
+
+        guard !resolvedRedirectURI.isEmpty else { return }
+
         let server = BangumiLANOAuthServer(
             config: .init(
                 clientID: Self.sharedClientID,
                 clientSecret: Self.sharedClientSecret,
-                redirectURI: lanRedirectURI,
+                redirectURI: resolvedRedirectURI,
                 localEndpoint: localEndpoint,
                 port: 8437
             ),
@@ -56,10 +83,11 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
                     print("[BangumiLANOAuth] \(message)")
                 }
             },
-            onAuthorizationCode: { [weak self] code in
+            onAuthorizationCode: { [weak self] code, redirectURI in
                 let stableCode = String(code)
+                let stableRedirectURI = String(redirectURI)
                 Task { @MainActor [weak self] in
-                    await self?.exchangeLANCodeForToken(code: stableCode)
+                    await self?.exchangeLANCodeForToken(code: stableCode, redirectURI: stableRedirectURI)
                 }
             }
         )
@@ -102,21 +130,19 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
             return
         }
 
-        guard let loginURL = Self.makeLoginRedirectURL(for: authorizationURL) else {
-            statusMessage = "生成 Bangumi 登录页地址失败。"
-            return
-        }
+        authenticationSession = nil
 
-        statusMessage = "正在打开 Bangumi 登录页…"
+        statusMessage = "正在打开 Bangumi 授权页…"
         isAuthenticating = true
 
         let session = ASWebAuthenticationSession(
-            url: loginURL,
+            url: authorizationURL,
             callback: .customScheme(Self.callbackScheme)
         ) { [weak self] callbackURL, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isAuthenticating = false
+                self.authenticationSession = nil
 
                 if let error {
                     self.statusMessage = "Bangumi 授权失败：\(error.localizedDescription)"
@@ -154,10 +180,10 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
 
         if session.start() {
             print("[BangumiOAuth] Authorization URL: \(authorizationURL.absoluteString)")
-            print("[BangumiOAuth] Login URL: \(loginURL.absoluteString)")
             print("[BangumiOAuth] Started web auth session")
         } else {
             isAuthenticating = false
+            authenticationSession = nil
             statusMessage = "无法启动系统认证会话。"
             print("[BangumiOAuth] Failed to start web auth session")
         }
@@ -249,11 +275,14 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
         return address
     }
 
-    private func exchangeLANCodeForToken(code: String) async {
+    private func exchangeLANCodeForToken(code: String, redirectURI: String) async {
         let stableCode = NSString(string: code) as String
+        let effectiveRedirectURI = redirectURI.isEmpty ? lanRedirectURI : redirectURI
+        isAuthenticating = true
+        defer { isAuthenticating = false }
         do {
             statusMessage = "局域网登录已收到 Bangumi 回调，正在交换 access token…"
-            guard !lanRedirectURI.isEmpty else {
+            guard !effectiveRedirectURI.isEmpty else {
                 statusMessage = "局域网登录失败：电视当前回调地址为空。"
                 return
             }
@@ -261,11 +290,11 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
                 code: stableCode,
                 clientID: Self.sharedClientID,
                 clientSecret: Self.sharedClientSecret,
-                redirectURI: lanRedirectURI
+                redirectURI: effectiveRedirectURI
             )
             try await applyTokenResponse(
                 tokenResponse,
-                redirectURI: lanRedirectURI
+                redirectURI: effectiveRedirectURI
             )
             statusMessage = "局域网登录成功"
         } catch {
@@ -395,6 +424,21 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
             from: tokenResponse,
             redirectURI: redirectURI
         )
+        if let database {
+            _ = try await AniTVDatabase.upsertCurrentUserProfile(
+                bgmUserID: session.bgmUserID,
+                username: session.username,
+                nickname: session.nickname,
+                avatar: session.avatar,
+                accessToken: session.accessToken,
+                refreshToken: session.refreshToken,
+                tokenType: session.tokenType,
+                expiresAt: session.expiresAt,
+                in: database
+            )
+            try await AniTVDatabase.setBangumiOAuthRedirectURI(session.redirectURI, in: database)
+            try await AniTVDatabase.setBangumiOAuthRefreshBlocked(false, in: database)
+        }
         publish(
             session: session,
             tokenResponse: tokenResponse,
@@ -452,7 +496,7 @@ final class BangumiOAuthManager: NSObject, ObservableObject {
             bgmUserID: user.id,
             username: user.username,
             nickname: user.nickname,
-            avatar: user.avatar.large ?? user.avatar.medium ?? user.avatar.small,
+            avatar: user.avatar?.large ?? user.avatar?.medium ?? user.avatar?.small,
             accessToken: tokenResponse.accessToken,
             refreshToken: tokenResponse.refreshToken,
             tokenType: tokenResponse.tokenType,
@@ -499,7 +543,7 @@ private struct BangumiCurrentUser: Decodable {
     let id: Int
     let username: String
     let nickname: String
-    let avatar: BangumiCurrentUserAvatar
+    let avatar: BangumiCurrentUserAvatar?
 }
 
 private struct BangumiCurrentUserAvatar: Decodable {
@@ -557,30 +601,46 @@ private enum BangumiTokenExchangeService {
         request.setValue(APIConfig.userAgent, forHTTPHeaderField: "User-Agent")
         request.httpBody = Data(bodyString.utf8)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OAuthError.invalidTokenResponse
-        }
+        let maxAttempts = 2
+        var lastError: Error?
 
-        guard 200..<300 ~= httpResponse.statusCode else {
+        for attempt in 1...maxAttempts {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw OAuthError.invalidTokenResponse
+            }
+
+            if 200..<300 ~= httpResponse.statusCode {
+                let wire = try JSONDecoder().decode(BangumiOAuthTokenResponseWire.self, from: data)
+                return BangumiOAuthTokenResponse(
+                    accessToken: wire.accessToken,
+                    expiresIn: wire.expiresIn,
+                    tokenType: wire.tokenType,
+                    scope: wire.scope,
+                    refreshToken: wire.refreshToken,
+                    userID: wire.userID,
+                    rawResponse: String(data: data, encoding: .utf8) ?? ""
+                )
+            }
+
             let responseText = String(data: data, encoding: .utf8) ?? "<non-utf8>"
             if let oauthError = try? JSONDecoder().decode(BangumiOAuthErrorResponseWire.self, from: data),
                oauthError.error == "invalid_grant" {
                 throw OAuthError.invalidGrant(response: responseText)
             }
-            throw OAuthError.tokenExchangeFailed(statusCode: httpResponse.statusCode, response: responseText)
+
+            let error = OAuthError.tokenExchangeFailed(statusCode: httpResponse.statusCode, response: responseText)
+            lastError = error
+
+            if (500..<600).contains(httpResponse.statusCode), attempt < maxAttempts {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                continue
+            }
+
+            throw error
         }
 
-        let wire = try JSONDecoder().decode(BangumiOAuthTokenResponseWire.self, from: data)
-        return BangumiOAuthTokenResponse(
-            accessToken: wire.accessToken,
-            expiresIn: wire.expiresIn,
-            tokenType: wire.tokenType,
-            scope: wire.scope,
-            refreshToken: wire.refreshToken,
-            userID: wire.userID,
-            rawResponse: String(data: data, encoding: .utf8) ?? ""
-        )
+        throw lastError ?? OAuthError.invalidTokenResponse
     }
 
     private static func formURLEncode(_ value: String) -> String {
