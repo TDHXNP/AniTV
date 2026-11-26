@@ -12,54 +12,196 @@ import Kingfisher
 import SQLiteData
 import Dependencies
 
+private struct TimelineCardModel: Identifiable, Equatable, Sendable {
+    let id: String
+    let bangumiID: Int?
+    let displayTitle: String
+    let episodeLine: String
+    let displayTime: String
+    let coverURL: URL?
+    let airingTimestamp: Int
+    let isUnknownTime: Bool
+}
+
+private struct TimelineDaySectionModel: Identifiable, Equatable, Sendable {
+    let id: String
+    let monthDayText: String
+    let subtitleText: String
+    let isToday: Bool
+    let cards: [TimelineCardModel]
+    let cardIDs: Set<String>
+}
+
+private struct TimelineInitialTarget: Equatable, Sendable {
+    let dayKey: String
+    let entryID: String
+    let leadingDayKey: String
+}
+
 @MainActor
 final class TimelineStore: ObservableObject {
-    @Published private(set) var timeline: TimelineDayMap = [:]
-    @Published private(set) var orderedDays: [String] = []
+    static let shared = TimelineStore()
+
+    @Published fileprivate private(set) var sections: [TimelineDaySectionModel] = []
+    @Published fileprivate private(set) var initialTarget: TimelineInitialTarget?
     @Published private(set) var isLoading = true
     @Published private(set) var errorMessage = ""
 
     private let service = TimelineService()
     private var hasLoaded = false
+    private var lastLoadedDayKey = ""
+    private var isCurrentlyFetching = false
+
+    private init() {}
 
     func loadIfNeeded(database: any DatabaseWriter) async {
-        guard !hasLoaded else { return }
-        hasLoaded = true
+        let currentDayKey = TimelineBoardFormatter.todayKey
+        if hasLoaded, !sections.isEmpty, lastLoadedDayKey == currentDayKey {
+            isLoading = false
+            return
+        }
         await load(database: database)
     }
 
     func load(database: any DatabaseWriter) async {
-        isLoading = true
-        errorMessage = ""
+        guard !isCurrentlyFetching else { return }
+        isCurrentlyFetching = true
+        defer { isCurrentlyFetching = false }
 
-        let startTime = Date()
+        if sections.isEmpty {
+            isLoading = true
+        }
+        errorMessage = ""
 
         do {
             let map = try await service.fetchTimelineMap(database: database)
-            
-            // Ensure loading takes at least 400ms to allow tvOS focus transitions
-            // and sidebar collapse animations to stabilize before replacing the view hierarchy.
-            let elapsed = Date().timeIntervalSince(startTime)
-            if elapsed < 0.4 {
-                try? await Task.sleep(for: .milliseconds(Int((0.4 - elapsed) * 1000)))
-            }
+            let now = Date()
+            let built = await Task.detached(priority: .userInitiated) {
+                TimelineViewModelBuilder.build(from: map, now: now)
+            }.value
 
-            timeline = map
-            orderedDays = map.keys.sorted()
+            sections = built.sections
+            initialTarget = built.initialTarget
+            lastLoadedDayKey = built.todayKey
             isLoading = false
             hasLoaded = true
         } catch {
-            errorMessage = error.localizedDescription
+            if sections.isEmpty {
+                errorMessage = error.localizedDescription
+            }
             isLoading = false
-            hasLoaded = false
+            hasLoaded = !sections.isEmpty
         }
+    }
+}
+
+private enum TimelineViewModelBuilder {
+    nonisolated static func build(
+        from map: TimelineDayMap,
+        now: Date
+    ) -> (sections: [TimelineDaySectionModel], initialTarget: TimelineInitialTarget?, todayKey: String) {
+        let calendar = TimelineBoardFormatter.makeCalendar()
+        let dayFormatter = TimelineBoardFormatter.makeDayKeyFormatter(calendar: calendar)
+        let monthDayFormatter = TimelineBoardFormatter.makeMonthDayFormatter(calendar: calendar)
+        let timeFormatter = TimelineBoardFormatter.makeTimeFormatter(calendar: calendar)
+
+        let todayKey = dayFormatter.string(from: now)
+        let todayWeekStart = TimelineBoardFormatter.startOfWeek(for: now, calendar: calendar)
+        let orderedDays = map.keys.sorted()
+
+        var sections: [TimelineDaySectionModel] = []
+        sections.reserveCapacity(orderedDays.count)
+
+        for dayKey in orderedDays {
+            let entries = map[dayKey] ?? []
+            let date = dayFormatter.date(from: dayKey)
+            let monthDayText = date.map { monthDayFormatter.string(from: $0) } ?? dayKey
+            let isToday = dayKey == todayKey
+            let subtitleText: String
+            if isToday {
+                subtitleText = "Today"
+            } else if let date {
+                subtitleText = TimelineBoardFormatter.weekdayText(
+                    for: date,
+                    todayWeekStart: todayWeekStart,
+                    calendar: calendar
+                )
+            } else {
+                subtitleText = ""
+            }
+
+            var cards: [TimelineCardModel] = []
+            cards.reserveCapacity(entries.count)
+            var cardIDs: Set<String> = []
+            cardIDs.reserveCapacity(entries.count)
+
+            for entry in entries {
+                let cnTitle = entry.subjectTitleCN?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let displayTitle = cnTitle.isEmpty ? entry.subjectTitle : cnTitle
+
+                let cnEpisode = entry.episodeNameCN?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let episodeTitle = !cnEpisode.isEmpty
+                    ? cnEpisode
+                    : (entry.episodeName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+                let sortText = TimelineBoardFormatter.episodeText(for: entry.episodeSort)
+                let episodeLine = episodeTitle.isEmpty
+                    ? "第 \(sortText) 集"
+                    : "第 \(sortText) 集 \(episodeTitle)"
+
+                let isUnknownTime = entry.airingTimestamp == .max
+                let displayTime = isUnknownTime
+                    ? "unknown"
+                    : timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(entry.airingTimestamp)))
+
+                let card = TimelineCardModel(
+                    id: entry.id,
+                    bangumiID: entry.bangumiID.flatMap(Int.init),
+                    displayTitle: displayTitle,
+                    episodeLine: episodeLine,
+                    displayTime: displayTime,
+                    coverURL: entry.coverImageURL.flatMap(URL.init(string:)),
+                    airingTimestamp: entry.airingTimestamp,
+                    isUnknownTime: isUnknownTime
+                )
+                cards.append(card)
+                cardIDs.insert(card.id)
+            }
+
+            sections.append(
+                TimelineDaySectionModel(
+                    id: dayKey,
+                    monthDayText: monthDayText,
+                    subtitleText: subtitleText,
+                    isToday: isToday,
+                    cards: cards,
+                    cardIDs: cardIDs
+                )
+            )
+        }
+
+        let nowTimestamp = Int(now.timeIntervalSince1970)
+        var initialTarget: TimelineInitialTarget?
+        for index in sections.indices.reversed() {
+            let section = sections[index]
+            if let lastAired = section.cards.last(where: { $0.airingTimestamp <= nowTimestamp }) {
+                let leadingIndex = max(index - 1, 0)
+                initialTarget = TimelineInitialTarget(
+                    dayKey: section.id,
+                    entryID: lastAired.id,
+                    leadingDayKey: sections[leadingIndex].id
+                )
+                break
+            }
+        }
+
+        return (sections, initialTarget, todayKey)
     }
 }
 
 struct TimelineView: View {
     let openAnimeDetail: (Int) -> Void
 
-    @StateObject private var store = TimelineStore()
+    @ObservedObject private var store = TimelineStore.shared
     @Dependency(\.defaultDatabase) private var database
 
     var body: some View {
@@ -83,15 +225,15 @@ struct TimelineView: View {
                     }
                     .buttonStyle(.borderedProminent)
                 }
-            } else if store.orderedDays.isEmpty {
+            } else if store.sections.isEmpty {
                 ContentUnavailableView(
                     "暂无时间线数据",
                     systemImage: "calendar"
                 )
             } else {
                 TimelineBoardView(
-                    orderedDays: store.orderedDays,
-                    timeline: store.timeline,
+                    sections: store.sections,
+                    initialTarget: store.initialTarget,
                     openAnimeDetail: openAnimeDetail
                 )
             }
@@ -123,57 +265,44 @@ private enum TimelinePosterCache {
         didConfigure = true
 
         ImageCache.default.memoryStorage.config.expiration = .days(7)
+        ImageCache.default.memoryStorage.config.totalCostLimit = 120 * 1024 * 1024
+        ImageCache.default.memoryStorage.config.countLimit = 160
         ImageCache.default.diskStorage.config.expiration = .days(7)
     }
 }
 
 private struct TimelineBoardView: View {
-    let orderedDays: [String]
-    let timeline: TimelineDayMap
+    let sections: [TimelineDaySectionModel]
+    let initialTarget: TimelineInitialTarget?
     let openAnimeDetail: (Int) -> Void
 
     @Namespace private var timelineFocusScope
     @FocusState private var focusedEntryID: String?
     @State private var didScrollToInitialPosition = false
-    @State private var currentTime = Date()
-    private let currentTimeTicker = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
-
-    /// The day key and entry ID of the last aired episode across all days.
-    /// Computed property so it's available from the very first render.
-    private var lastAiredTarget: (day: String, entryID: String)? {
-        let nowTimestamp = Int(currentTime.timeIntervalSince1970)
-        for day in orderedDays.reversed() {
-            let entries = timeline[day, default: []]
-            if let lastAired = entries.last(where: { $0.airingTimestamp <= nowTimestamp }) {
-                return (day, lastAired.id)
-            }
-        }
-        return nil
-    }
 
     var body: some View {
-        let initialFocusDay = lastAiredTarget?.day ?? orderedDays.first
+        let initialFocusDay = initialTarget?.dayKey ?? sections.first?.id
 
         ScrollViewReader { scrollProxy in
             GeometryReader { proxy in
+                let columnHeight = max(proxy.size.height - 36, 320)
+
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 28) {
-                        ForEach(orderedDays, id: \.self) { day in
+                    LazyHStack(alignment: .top, spacing: 28) {
+                        ForEach(sections) { section in
                             TimelineDayColumnView(
-                                dayKey: day,
-                                entries: timeline[day, default: []],
-                                isToday: day == TimelineBoardFormatter.todayKey,
-                                availableHeight: max(proxy.size.height - 36, 320),
-                                shouldPreferInitialFocus: day == initialFocusDay,
-                                currentTime: currentTime,
+                                section: section,
+                                availableHeight: columnHeight,
+                                shouldPreferInitialFocus: section.id == initialFocusDay,
+                                initialPreferredEntryID: section.id == initialFocusDay ? initialTarget?.entryID : nil,
                                 focusedEntryID: $focusedEntryID,
                                 focusScope: timelineFocusScope,
                                 openAnimeDetail: openAnimeDetail
                             )
-                            .id(day)
+                            .id(section.id)
                         }
                     }
-                    .frame(height: proxy.size.height - 36, alignment: .top)
+                    .frame(height: max(proxy.size.height - 36, 0), alignment: .top)
                     .padding(.horizontal, 48)
                     .padding(.top, 36)
                 }
@@ -184,46 +313,33 @@ private struct TimelineBoardView: View {
                     didScrollToInitialPosition = true
                     await focusInitialEntry(using: scrollProxy)
                 }
-                .onReceive(currentTimeTicker) { value in
-                    currentTime = value
-                }
             }
         }
     }
 
     private func focusInitialEntry(using scrollProxy: ScrollViewProxy) async {
-        guard let (targetDay, targetEntryID) = lastAiredTarget else { return }
+        guard let target = initialTarget else { return }
 
-        let dayIndex = orderedDays.firstIndex(of: targetDay) ?? 0
-        let leadingIndex = max(dayIndex - 1, 0)
-        let leadingDay = orderedDays[leadingIndex]
+        // Scroll immediately so LazyHStack materializes the target column right away.
+        scrollProxy.scrollTo(target.leadingDayKey, anchor: .leading)
 
-        // Brief delay to let prefersDefaultFocus auto-scroll resolve,
-        // then override with our desired position (D-1 at leading edge).
-        try? await Task.sleep(for: .milliseconds(100))
+        try? await Task.sleep(for: .milliseconds(80))
 
-        withAnimation(.easeInOut(duration: 0.35)) {
-            scrollProxy.scrollTo(leadingDay, anchor: .leading)
+        withAnimation(.easeInOut(duration: 0.25)) {
+            scrollProxy.scrollTo(target.leadingDayKey, anchor: .leading)
         }
 
-        // Wait for the horizontal scroll to settle, then set focus.
-        // The column's onChange gate is still closed at this point,
-        // so this won't cause a .center vertical scroll override.
-        try? await Task.sleep(for: .milliseconds(400))
+        try? await Task.sleep(for: .milliseconds(220))
 
-        focusedEntryID = nil
-        await Task.yield()
-        focusedEntryID = targetEntryID
+        focusedEntryID = target.entryID
     }
 }
 
 private struct TimelineDayColumnView: View {
-    let dayKey: String
-    let entries: [TimelineEpisodeEntry]
-    let isToday: Bool
+    let section: TimelineDaySectionModel
     let availableHeight: CGFloat
     let shouldPreferInitialFocus: Bool
-    let currentTime: Date
+    let initialPreferredEntryID: String?
     let focusedEntryID: FocusState<String?>.Binding
     let focusScope: Namespace.ID
     let openAnimeDetail: (Int) -> Void
@@ -231,23 +347,48 @@ private struct TimelineDayColumnView: View {
     private let headerHeight: CGFloat = 72
     @State private var didScrollToPreferredEntry = false
     @State private var didInitialVerticalScroll = false
+    @State private var todayNow = Date()
+
+    private var splitterInsertionIndex: Int? {
+        guard section.isToday else { return nil }
+        let nowTimestamp = Int(todayNow.timeIntervalSince1970)
+        return section.cards.firstIndex { $0.airingTimestamp > nowTimestamp }
+    }
+
+    private var preferredFocusIndex: Int {
+        if let initialPreferredEntryID,
+           let matchedIndex = section.cards.firstIndex(where: { $0.id == initialPreferredEntryID }) {
+            return matchedIndex
+        }
+        if let splitterInsertionIndex {
+            return max(splitterInsertionIndex - 1, 0)
+        }
+        return max(section.cards.count - 1, 0)
+    }
+
+    private var verticalScrollAnchorID: String? {
+        let anchorIndex = max(preferredFocusIndex - 2, 0)
+        guard section.cards.indices.contains(anchorIndex) else { return nil }
+        return section.cards[anchorIndex].id
+    }
+
+    private var shouldShowSplitterAtEnd: Bool {
+        section.isToday && !section.cards.isEmpty && splitterInsertionIndex == nil
+    }
 
     var body: some View {
+        let insertionIndex = splitterInsertionIndex
+        let preferredIndex = preferredFocusIndex
+
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(TimelineBoardFormatter.monthDayText(for: dayKey))
+                Text(section.monthDayText)
                     .font(.system(size: 34, weight: .heavy))
                     .foregroundStyle(.white)
 
-                if isToday {
-                    Text("Today")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.cyan.opacity(0.9))
-                } else {
-                    Text(TimelineBoardFormatter.weekdayText(for: dayKey))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
+                Text(section.subtitleText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(section.isToday ? Color.cyan.opacity(0.9) : .secondary)
             }
             .padding(.horizontal, 6)
             .frame(height: headerHeight, alignment: .topLeading)
@@ -255,26 +396,28 @@ private struct TimelineDayColumnView: View {
 
             ScrollViewReader { scrollProxy in
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
-                            if shouldShowSplitter(before: index) {
-                                TimelineNowSplitter(currentTime: currentTime)
+                    LazyVStack(alignment: .leading, spacing: 22) {
+                        ForEach(Array(section.cards.enumerated()), id: \.element.id) { index, card in
+                            if let insertionIndex, index == insertionIndex {
+                                TimelineNowSplitter(currentTime: todayNow)
                             }
 
                             TimelineEpisodeCard(
-                                entry: entry,
-                                shouldPreferFocus: shouldPreferInitialFocus && preferredFocusIndex == index,
+                                card: card,
+                                shouldPreferFocus: shouldPreferInitialFocus && preferredIndex == index,
                                 focusedEntryID: focusedEntryID,
                                 focusScope: focusScope,
                                 openAnimeDetail: openAnimeDetail
                             )
-                            .id(entry.id)
+                            .id(card.id)
                         }
 
                         if shouldShowSplitterAtEnd {
-                            TimelineNowSplitter(currentTime: currentTime)
+                            TimelineNowSplitter(currentTime: todayNow)
                         }
                     }
+                    .padding(.top, 10)
+                    .padding(.bottom, 24)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
                 .frame(height: max(availableHeight - headerHeight, 220))
@@ -284,110 +427,75 @@ private struct TimelineDayColumnView: View {
                           let anchorID = verticalScrollAnchorID else { return }
 
                     didScrollToPreferredEntry = true
+                    scrollProxy.scrollTo(anchorID, anchor: .top)
 
-                    // Wait for prefersDefaultFocus auto-scroll to settle,
-                    // then override with our desired position.
-                    try? await Task.sleep(for: .milliseconds(100))
-
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        scrollProxy.scrollTo(anchorID, anchor: .top)
-                    }
-
-                    // Keep the onChange gate closed long enough to cover the board's
-                    // programmatic focus set (~500ms from view appear), preventing
-                    // .center scrolls from overriding our .top position.
-                    try? await Task.sleep(for: .milliseconds(600))
+                    try? await Task.sleep(for: .milliseconds(350))
                     didInitialVerticalScroll = true
+                }
+                .task(id: section.isToday) {
+                    guard section.isToday else { return }
+                    todayNow = Date()
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                        guard !Task.isCancelled else { break }
+                        todayNow = Date()
+                    }
                 }
                 .onChange(of: focusedEntryID.wrappedValue) { _, newValue in
                     guard let newValue,
-                          entries.contains(where: { $0.id == newValue }) else { return }
+                          section.cardIDs.contains(newValue) else { return }
 
-                    // Suppress scroll during initial setup — the .task above
-                    // already positioned the scroll correctly.
                     if shouldPreferInitialFocus && !didInitialVerticalScroll {
                         return
                     }
 
-                    DispatchQueue.main.async {
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            scrollProxy.scrollTo(newValue, anchor: .center)
-                        }
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        scrollProxy.scrollTo(newValue, anchor: .center)
                     }
                 }
             }
         }
         .frame(width: 420, height: availableHeight, alignment: .topLeading)
     }
-
-    private var splitterInsertionIndex: Int? {
-        guard isToday else { return nil }
-        let nowTimestamp = Int(currentTime.timeIntervalSince1970)
-
-        for (index, entry) in entries.enumerated() where entry.airingTimestamp > nowTimestamp {
-            return index
-        }
-        return nil
-    }
-
-    private var preferredFocusIndex: Int {
-        if let splitterInsertionIndex {
-            return max(splitterInsertionIndex - 1, 0)
-        }
-        return max(entries.count - 1, 0)
-    }
-
-    private var preferredEntryID: String? {
-        guard entries.indices.contains(preferredFocusIndex) else { return nil }
-        return entries[preferredFocusIndex].id
-    }
-
-    /// The entry 2 positions before the preferred focus target, used as
-    /// the vertical scroll anchor with `.top` so the target appears
-    /// more towards the center of the screen.
-    private var verticalScrollAnchorID: String? {
-        let anchorIndex = max(preferredFocusIndex - 2, 0)
-        guard entries.indices.contains(anchorIndex) else { return nil }
-        return entries[anchorIndex].id
-    }
-
-    private var shouldShowSplitterAtEnd: Bool {
-        isToday && !entries.isEmpty && splitterInsertionIndex == nil
-    }
-
-    private func shouldShowSplitter(before index: Int) -> Bool {
-        guard let splitterInsertionIndex else { return false }
-        return index == splitterInsertionIndex
-    }
 }
 
 private struct TimelineEpisodeCard: View {
-    let entry: TimelineEpisodeEntry
+    let card: TimelineCardModel
     let shouldPreferFocus: Bool
     let focusedEntryID: FocusState<String?>.Binding
     let focusScope: Namespace.ID
     let openAnimeDetail: (Int) -> Void
 
+    private static let cardBackgroundGradient = LinearGradient(
+        colors: [
+            Color.white.opacity(0.1),
+            Color.white.opacity(0.04)
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
     var body: some View {
-        Spacer(minLength: 10)
         ZStack(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .top, spacing: 10) {
-                    Text(displayTitle)
+                    Text(card.displayTitle)
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(2)
 
-
-                    Text(displayTime)
+                    Text(card.displayTime)
                         .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(timeColor)
+                        .foregroundStyle(card.isUnknownTime ? .white.opacity(0.7) : .cyan.opacity(0.95))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(timeBackground, in: Capsule())
+                        .background(
+                            card.isUnknownTime ? Color.white.opacity(0.08) : Color.cyan.opacity(0.18),
+                            in: Capsule()
+                        )
                 }
 
-                Text(episodeLine)
+                Text(card.episodeLine)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.white.opacity(0.74))
                     .lineLimit(2)
@@ -397,20 +505,20 @@ private struct TimelineEpisodeCard: View {
             .padding(.trailing, 18)
             .padding(.bottom, 18)
             .frame(maxWidth: .infinity, minHeight: 148, alignment: .topLeading)
-            .background(cardBackground, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .background(Self.cardBackgroundGradient, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .stroke(Color.white.opacity(0.08), lineWidth: 1.2)
             )
 
             TimelinePosterButton(
-                imageURL: entry.coverImageURL,
+                imageURL: card.coverURL,
                 shouldPreferFocus: shouldPreferFocus,
-                focusID: entry.id,
+                focusID: card.id,
                 focusedEntryID: focusedEntryID,
                 focusScope: focusScope,
                 onOpen: {
-                    if let bangumiID = entry.bangumiID.flatMap(Int.init) {
+                    if let bangumiID = card.bangumiID {
                         openAnimeDetail(bangumiID)
                     }
                 }
@@ -420,57 +528,11 @@ private struct TimelineEpisodeCard: View {
             .zIndex(1)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .padding(.top, -10)
-//        .offset(y: -10)
-    }
-
-    private var displayTitle: String {
-        let cn = entry.subjectTitleCN?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return cn.isEmpty ? entry.subjectTitle : cn
-    }
-
-    private var displayEpisodeTitle: String {
-        let cn = entry.episodeNameCN?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !cn.isEmpty { return cn }
-
-        let original = entry.episodeName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return original
-    }
-
-    private var episodeLine: String {
-        let sortValue = TimelineBoardFormatter.episodeText(for: entry.episodeSort)
-        let episodeTitle = displayEpisodeTitle
-        if episodeTitle.isEmpty {
-            return "第 \(sortValue) 集"
-        }
-        return "第 \(sortValue) 集 \(episodeTitle)"
-    }
-
-    private var displayTime: String {
-        TimelineBoardFormatter.timeText(for: entry.airingTimestamp)
-    }
-
-    private var timeColor: Color {
-        entry.airingTimestamp == .max ? .white.opacity(0.7) : .cyan.opacity(0.95)
-    }
-
-    private var timeBackground: Color {
-        entry.airingTimestamp == .max ? .white.opacity(0.08) : .cyan.opacity(0.18)
-    }
-    private var cardBackground: LinearGradient {
-        return LinearGradient(
-            colors: [
-                Color.white.opacity(0.1),
-                Color.white.opacity(0.04)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
     }
 }
 
 private struct TimelinePosterButton: View {
-    let imageURL: String?
+    let imageURL: URL?
     let shouldPreferFocus: Bool
     let focusID: String
     let focusedEntryID: FocusState<String?>.Binding
@@ -479,19 +541,25 @@ private struct TimelinePosterButton: View {
 
     @Environment(\.isFocused) private var isFocused
 
+    private static let posterProcessor = DownsamplingImageProcessor(size: CGSize(width: 172, height: 244))
+    private static let placeholderGradient = LinearGradient(
+        colors: [Color.white.opacity(0.18), Color.white.opacity(0.05)],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+
     var body: some View {
         Button(action: {
             focusedEntryID.wrappedValue = focusID
             onOpen()
         }) {
-            KFImage(URL(string: imageURL ?? ""))
+            KFImage(imageURL)
                 .placeholder {
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.18), Color.white.opacity(0.05)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
+                    Self.placeholderGradient
                 }
+                .setProcessor(Self.posterProcessor)
+                .cacheOriginalImage()
+                .cancelOnDisappear(true)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: 86, height: 122)
@@ -502,12 +570,7 @@ private struct TimelinePosterButton: View {
         .prefersDefaultFocus(shouldPreferFocus, in: focusScope)
         .offset(y: isFocused ? 12 : 0)
         .zIndex(isFocused ? 2 : 0)
-        .animation(.easeInOut(duration: 0.18), value: isFocused)
-        .onChange(of: isFocused) { _, newValue in
-            if newValue {
-                focusedEntryID.wrappedValue = focusID
-            }
-        }
+        .animation(.easeInOut(duration: 0.16), value: isFocused)
     }
 }
 
@@ -528,54 +591,57 @@ private struct TimelineNowSplitter: View {
                 .fill(Color.cyan.opacity(0.85))
                 .frame(height: 3)
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
     }
 }
 
 private enum TimelineBoardFormatter {
-    static let calendar: Calendar = {
+    static let calendar: Calendar = makeCalendar()
+    static let dayKeyFormatter: DateFormatter = makeDayKeyFormatter(calendar: calendar)
+    static let timeFormatter: DateFormatter = makeTimeFormatter(calendar: calendar)
+
+    nonisolated static let weekdaySymbols = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+
+    nonisolated static func makeCalendar() -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
         return calendar
-    }()
+    }
 
-    static let monthDayFormatter: DateFormatter = {
+    nonisolated static func makeDayKeyFormatter(calendar: Calendar) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }
+
+    nonisolated static func makeMonthDayFormatter(calendar: Calendar) -> DateFormatter {
         let formatter = DateFormatter()
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "M/d"
         return formatter
-    }()
+    }
 
-    static let timeFormatter: DateFormatter = {
+    nonisolated static func makeTimeFormatter(calendar: Calendar) -> DateFormatter {
         let formatter = DateFormatter()
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "HH:mm"
         return formatter
-    }()
-
-    static let weekdaySymbols = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+    }
 
     static var todayKey: String {
-        key(for: Date())
+        dayKeyFormatter.string(from: Date())
     }
 
-    static func monthDayText(for key: String) -> String {
-        guard let date = date(from: key) else { return key }
-        return monthDayFormatter.string(from: date)
-    }
-
-    static func weekdayText(for key: String) -> String {
-        guard let date = date(from: key) else { return "" }
-
+    nonisolated static func weekdayText(for date: Date, todayWeekStart: Date, calendar: Calendar) -> String {
         let weekdayIndex = calendar.component(.weekday, from: date) - 1
         let weekday = weekdaySymbols.indices.contains(weekdayIndex) ? weekdaySymbols[weekdayIndex] : ""
         guard !weekday.isEmpty else { return "" }
 
-        let today = Date()
-        let targetWeekStart = startOfWeek(for: date)
-        let todayWeekStart = startOfWeek(for: today)
+        let targetWeekStart = startOfWeek(for: date, calendar: calendar)
         let dayOffset = calendar.dateComponents([.day], from: todayWeekStart, to: targetWeekStart).day ?? 0
 
         if dayOffset <= -7 {
@@ -587,20 +653,11 @@ private enum TimelineBoardFormatter {
         return weekday
     }
 
-    static func timeText(for timestamp: Int) -> String {
-        guard timestamp != .max else { return "unknown" }
-        return timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestamp)))
-    }
-
-    static func currentTimeText() -> String {
-        timeFormatter.string(from: Date())
-    }
-
     static func currentTimeText(for date: Date) -> String {
         timeFormatter.string(from: date)
     }
 
-    static func episodeText(for sort: Double?) -> String {
+    nonisolated static func episodeText(for sort: Double?) -> String {
         guard let sort else { return "?" }
         if abs(sort.rounded() - sort) < 0.0001 {
             return String(Int(sort.rounded()))
@@ -609,22 +666,10 @@ private enum TimelineBoardFormatter {
     }
 
     static func key(for date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        dayKeyFormatter.string(from: date)
     }
 
-    private static func date(from key: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: key)
-    }
-
-    private static func startOfWeek(for date: Date) -> Date {
+    nonisolated static func startOfWeek(for date: Date, calendar: Calendar) -> Date {
         let components = calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
         return calendar.date(from: components) ?? calendar.startOfDay(for: date)
     }
@@ -718,9 +763,10 @@ private enum TimelineBoardFormatter {
         ]
     ]
 
+    let built = TimelineViewModelBuilder.build(from: sampleTimeline, now: now)
     TimelineBoardView(
-        orderedDays: [yesterdayKey, todayKey, tomorrowKey],
-        timeline: sampleTimeline,
+        sections: built.sections,
+        initialTarget: built.initialTarget,
         openAnimeDetail: { _ in }
     )
 }

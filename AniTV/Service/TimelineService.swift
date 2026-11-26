@@ -74,49 +74,59 @@ struct TimelineService: Sendable {
         let fetchedAniListItems = try await anilistClient.fetchTimeline(window: window)
         let bangumiRows = try await AniTVDatabase.fetchAllBangumiDataRows(in: database)
 
-        let bangumiIndex = TimelineBangumiDataIndex(rows: bangumiRows, now: now)
-        let resolvedAniListItems = bangumiIndex.resolveAniListItems(fetchedAniListItems)
-        TimelineLogger.logDroppedAniListItems(resolvedAniListItems.droppedItems)
+        let prepared = await Task.detached(priority: .userInitiated) {
+            let bangumiIndex = TimelineBangumiDataIndex(rows: bangumiRows, now: now)
+            let resolvedAniListItems = bangumiIndex.resolveAniListItems(fetchedAniListItems)
+            TimelineLogger.logDroppedAniListItems(resolvedAniListItems.droppedItems)
 
-        let missingItems = bangumiIndex.findMissingItems(
-            excluding: Set(resolvedAniListItems.items.map(\.titleYearKey)),
-            withinLastDays: 365,
-            excludingBangumiIDs: Set(resolvedAniListItems.items.compactMap(\.bangumiID))
-        )
+            let missingItems = bangumiIndex.findMissingItems(
+                excluding: Set(resolvedAniListItems.items.map(\.titleYearKey)),
+                withinLastDays: 365,
+                excludingBangumiIDs: Set(resolvedAniListItems.items.compactMap(\.bangumiID))
+            )
 
-        let subjectNeeds = TimelineSubjectNeeds(
-            aniListItems: resolvedAniListItems.items,
-            missingItems: missingItems,
-            bangumiIndex: bangumiIndex
-        )
+            let subjectNeeds = TimelineSubjectNeeds(
+                aniListItems: resolvedAniListItems.items,
+                missingItems: missingItems,
+                bangumiIndex: bangumiIndex
+            )
+            let exactAiringHints = TimelineExactAiringHints(
+                aniListItems: resolvedAniListItems.items,
+                bangumiIndex: bangumiIndex
+            )
+            return (bangumiIndex, resolvedAniListItems, missingItems, subjectNeeds, exactAiringHints)
+        }.value
+
+        let (bangumiIndex, resolvedAniListItems, missingItems, subjectNeeds, exactAiringHints) = prepared
 
         let subjectCacheRows = try await AniTVDatabase.fetchAllTimelineBangumiSubjectCaches(in: database)
         let episodeCacheRows = try await AniTVDatabase.fetchAllTimelineBangumiEpisodeCaches(in: database)
-        let cacheState = TimelineCacheState(
-            subjectRows: subjectCacheRows,
-            episodeRows: episodeCacheRows,
-            now: now,
-            window: window
-        )
+        let cacheAnalysis = await Task.detached(priority: .userInitiated) {
+            let cacheState = TimelineCacheState(
+                subjectRows: subjectCacheRows,
+                episodeRows: episodeCacheRows,
+                now: now,
+                window: window
+            )
+            let subjectIDsToFetch = cacheState.subjectIDsNeedingRefresh(for: subjectNeeds)
+            return (cacheState.subjectByBangumiID, cacheState.episodesByBangumiID, subjectIDsToFetch)
+        }.value
 
-        let exactAiringHints = TimelineExactAiringHints(
-            aniListItems: resolvedAniListItems.items,
-            bangumiIndex: bangumiIndex
-        )
-        let subjectIDsToFetch = cacheState.subjectIDsNeedingRefresh(for: subjectNeeds)
-
-        var mergedSubjectCache = cacheState.subjectByBangumiID
-        var mergedEpisodeCache = cacheState.episodesByBangumiID
+        var mergedSubjectCache = cacheAnalysis.0
+        var mergedEpisodeCache = cacheAnalysis.1
+        let subjectIDsToFetch = cacheAnalysis.2
 
         if !subjectIDsToFetch.isEmpty {
             let fetchedSubjects = try await bangumiRepository.fetchTimelineSubjectDetails(
                 subjectIDs: subjectIDsToFetch.compactMap(Int.init)
             )
-            let cachePayload = TimelineCachePayloadBuilder.build(
-                subjects: fetchedSubjects,
-                now: now,
-                exactAiringHints: exactAiringHints
-            )
+            let cachePayload = await Task.detached(priority: .userInitiated) {
+                TimelineCachePayloadBuilder.build(
+                    subjects: fetchedSubjects,
+                    now: now,
+                    exactAiringHints: exactAiringHints
+                )
+            }.value
 
             try await AniTVDatabase.upsertTimelineBangumiSubjectCaches(cachePayload.subjectRows, in: database)
             try await AniTVDatabase.upsertTimelineBangumiEpisodeCaches(cachePayload.episodeRows, in: database)
@@ -127,14 +137,18 @@ struct TimelineService: Sendable {
             }
         }
 
-        let builtMap = TimelineMapBuilder.build(
-            aniListItems: resolvedAniListItems.items,
-            missingItems: missingItems,
-            bangumiIndex: bangumiIndex,
-            subjects: mergedSubjectCache,
-            episodesByBangumiID: mergedEpisodeCache,
-            window: window
-        )
+        let finalSubjects = mergedSubjectCache
+        let finalEpisodes = mergedEpisodeCache
+        let builtMap = await Task.detached(priority: .userInitiated) {
+            TimelineMapBuilder.build(
+                aniListItems: resolvedAniListItems.items,
+                missingItems: missingItems,
+                bangumiIndex: bangumiIndex,
+                subjects: finalSubjects,
+                episodesByBangumiID: finalEpisodes,
+                window: window
+            )
+        }.value
 
         try await AniTVDatabase.upsertTimelineMapCache(
             cacheKey: cacheKey,
@@ -147,7 +161,7 @@ struct TimelineService: Sendable {
 }
 
 private enum TimelineCalendar {
-    static func make() -> Calendar {
+    nonisolated static func make() -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
         return calendar
@@ -155,7 +169,7 @@ private enum TimelineCalendar {
 }
 
 private enum TimelineCacheKey {
-    static func make(
+    nonisolated static func make(
         calendar: Calendar,
         now: Date,
         daysBefore: Int,
@@ -167,13 +181,13 @@ private enum TimelineCacheKey {
     }
 }
 
-private struct TimelineWindow {
+private struct TimelineWindow: Sendable {
     let calendar: Calendar
     let now: Date
     let start: Date
     let end: Date
 
-    init(calendar: Calendar, now: Date, daysBefore: Int, daysAfter: Int) {
+    nonisolated init(calendar: Calendar, now: Date, daysBefore: Int, daysAfter: Int) {
         self.calendar = calendar
         self.now = now
         let startCandidate = calendar.date(byAdding: .day, value: -daysBefore, to: now) ?? now
@@ -189,16 +203,16 @@ private struct TimelineWindow {
         self.end = nextDayStart.addingTimeInterval(-1)
     }
 
-    func contains(_ date: Date) -> Bool {
+    nonisolated func contains(_ date: Date) -> Bool {
         start ... end ~= date
     }
 
-    func contains(dateString: String) -> Bool {
+    nonisolated func contains(dateString: String) -> Bool {
         guard let date = calendar.timelineDate(from: dateString) else { return false }
         return contains(date)
     }
 
-    func dayKey(for date: Date) -> String {
+    nonisolated func dayKey(for date: Date) -> String {
         date.timelineDayKey(calendar: calendar)
     }
 }
@@ -358,11 +372,11 @@ private struct AniListTimelineItem: Sendable {
         self.bangumiID = nil
     }
 
-    var titleYearKey: String {
+    nonisolated var titleYearKey: String {
         "\(subjectTitle)#\(seasonYear)"
     }
 
-    func withBangumiID(_ bangumiID: String) -> AniListTimelineItem {
+    nonisolated func withBangumiID(_ bangumiID: String) -> AniListTimelineItem {
         AniListTimelineItem(
             anilistID: anilistID,
             subjectTitle: subjectTitle,
@@ -375,7 +389,7 @@ private struct AniListTimelineItem: Sendable {
         )
     }
 
-    private init(
+    private nonisolated init(
         anilistID: Int,
         subjectTitle: String,
         seasonYear: Int,
@@ -460,7 +474,7 @@ struct TimelineBangumiEpisodeCacheRow: Decodable, Sendable {
     }
 }
 
-private struct TimelineBangumiItem {
+private struct TimelineBangumiItem: Sendable {
     let bangumiID: String?
     let aniListID: Int?
     let title: String
@@ -469,30 +483,32 @@ private struct TimelineBangumiItem {
     let type: String
 }
 
-private struct TimelineMissingBangumiItem {
+private struct TimelineMissingBangumiItem: Sendable {
     let bangumiID: String
     let title: String
     let beginDate: Date?
     let beginYear: Int
 }
 
-private struct TimelineBangumiDataIndex {
+private struct TimelineBangumiDataIndex: Sendable {
     let aniListToBangumi: [Int: TimelineBangumiItem]
     let missingAniListItems: [TimelineBangumiItem]
     let itemsByNormalizedTitle: [String: [TimelineBangumiItem]]
     let now: Date
 
-    init(rows: [TimelineBangumiDataRow], now: Date) {
+    nonisolated init(rows: [TimelineBangumiDataRow], now: Date) {
         var aniListToBangumi: [Int: TimelineBangumiItem] = [:]
         var missingAniListItems: [TimelineBangumiItem] = []
         var itemsByNormalizedTitle: [String: [TimelineBangumiItem]] = [:]
+        let calendar = Calendar.current
+        let decoder = JSONDecoder()
 
         for row in rows {
             let beginDate = TimelineParser.parseISO8601(row.begin)
-            let beginYear = beginDate.map { Calendar.current.component(.year, from: $0) }
+            let beginYear = beginDate.map { calendar.component(.year, from: $0) }
             let item = TimelineBangumiItem(
                 bangumiID: row.bangumiID.isEmpty ? nil : row.bangumiID,
-                aniListID: TimelineParser.extractSiteID(named: "aniList", from: row.sites).flatMap(Int.init),
+                aniListID: TimelineParser.extractSiteID(named: "aniList", from: row.sites, decoder: decoder).flatMap(Int.init),
                 title: row.title,
                 beginDate: beginDate,
                 beginYear: beginYear,
@@ -516,11 +532,11 @@ private struct TimelineBangumiDataIndex {
         self.now = now
     }
 
-    func bangumiItem(for aniListID: Int) -> TimelineBangumiItem? {
+    nonisolated func bangumiItem(for aniListID: Int) -> TimelineBangumiItem? {
         aniListToBangumi[aniListID]
     }
 
-    func resolveAniListItems(_ items: [AniListTimelineItem]) -> TimelineResolvedAniListItems {
+    nonisolated func resolveAniListItems(_ items: [AniListTimelineItem]) -> TimelineResolvedAniListItems {
         let currentYear = Calendar.current.component(.year, from: now)
         let allowedYears = (currentYear - 1)...(currentYear + 1)
 
@@ -570,7 +586,7 @@ private struct TimelineBangumiDataIndex {
         return TimelineResolvedAniListItems(items: keptItems, droppedItems: droppedItems)
     }
 
-    func findMissingItems(
+    nonisolated func findMissingItems(
         excluding keys: Set<String>,
         withinLastDays days: Int,
         excludingBangumiIDs: Set<String>
@@ -600,7 +616,7 @@ private struct TimelineBangumiDataIndex {
     }
 }
 
-private struct TimelineResolvedAniListItems {
+private struct TimelineResolvedAniListItems: Sendable {
     let items: [AniListTimelineItem]
     let droppedItems: [TimelineDroppedAniListItem]
 }
@@ -612,11 +628,11 @@ private struct TimelineDroppedAniListItem: Sendable {
     let airingAt: Int
 }
 
-private struct TimelineSubjectNeeds {
+private struct TimelineSubjectNeeds: Sendable {
     let mappedEpisodesByBangumiID: [String: Set<Int>]
     let missingBangumiItems: [TimelineMissingBangumiItem]
 
-    init(
+    nonisolated init(
         aniListItems: [AniListTimelineItem],
         missingItems: [TimelineMissingBangumiItem],
         bangumiIndex: TimelineBangumiDataIndex
@@ -631,10 +647,10 @@ private struct TimelineSubjectNeeds {
     }
 }
 
-private struct TimelineExactAiringHints {
+private struct TimelineExactAiringHints: Sendable {
     let timestampsByBangumiIDAndEpisode: [String: [Int: Int]]
 
-    init(aniListItems: [AniListTimelineItem], bangumiIndex: TimelineBangumiDataIndex) {
+    nonisolated init(aniListItems: [AniListTimelineItem], bangumiIndex: TimelineBangumiDataIndex) {
         var result: [String: [Int: Int]] = [:]
         for item in aniListItems {
             guard let bangumiID = item.bangumiID else { continue }
@@ -644,13 +660,13 @@ private struct TimelineExactAiringHints {
     }
 }
 
-private struct TimelineCacheState {
+private struct TimelineCacheState: Sendable {
     let subjectByBangumiID: [String: TimelineBangumiSubjectCacheRow]
     let episodesByBangumiID: [String: [TimelineBangumiEpisodeCacheRow]]
     let nowTimestamp: Int
     let window: TimelineWindow
 
-    init(
+    nonisolated init(
         subjectRows: [TimelineBangumiSubjectCacheRow],
         episodeRows: [TimelineBangumiEpisodeCacheRow],
         now: Date,
@@ -662,7 +678,7 @@ private struct TimelineCacheState {
         self.window = window
     }
 
-    func subjectIDsNeedingRefresh(for needs: TimelineSubjectNeeds) -> [String] {
+    nonisolated func subjectIDsNeedingRefresh(for needs: TimelineSubjectNeeds) -> [String] {
         var required: Set<String> = []
 
         for (bangumiID, episodes) in needs.mappedEpisodesByBangumiID {
@@ -701,7 +717,7 @@ private struct TimelineCacheState {
 }
 
 private struct TimelineCachePayloadBuilder {
-    static func build(
+    nonisolated static func build(
         subjects: [Int: BangumiGraphQLTimelineSubjectNode],
         now: Date,
         exactAiringHints: TimelineExactAiringHints
@@ -770,7 +786,7 @@ private struct TimelineCachePayloadBuilder {
         return (subjectRows, episodeRows, subjectMap, episodeMap)
     }
 
-    private static func computeEpisodeExpiry(
+    private nonisolated static func computeEpisodeExpiry(
         episode: BangumiGraphQLTimelineEpisodeNode,
         exactAiringAt: Int?,
         nowTimestamp: Int,
@@ -800,7 +816,7 @@ private struct TimelineCachePayloadBuilder {
 }
 
 private enum TimelineMapBuilder {
-    static func build(
+    nonisolated static func build(
         aniListItems: [AniListTimelineItem],
         missingItems: [TimelineMissingBangumiItem],
         bangumiIndex: TimelineBangumiDataIndex,
@@ -810,6 +826,18 @@ private enum TimelineMapBuilder {
     ) -> TimelineDayMap {
         var map: TimelineDayMap = [:]
         let nowTimestamp = Int(window.now.timeIntervalSince1970)
+        let decoder = JSONDecoder()
+        var decodedImageURLBySubjectID: [String: String?] = [:]
+        decodedImageURLBySubjectID.reserveCapacity(subjects.count)
+
+        func resolvedImageURL(for bangumiID: String, subjectRow: TimelineBangumiSubjectCacheRow) -> String? {
+            if let cached = decodedImageURLBySubjectID[bangumiID] {
+                return cached
+            }
+            let url = subjectRow.decodedImageURL(using: decoder)
+            decodedImageURLBySubjectID[bangumiID] = url
+            return url
+        }
 
         for item in aniListItems {
             let bangumiID = item.bangumiID
@@ -818,6 +846,11 @@ private enum TimelineMapBuilder {
                 episodesByBangumiID[bangumiID]?.first(where: {
                     $0.isValid(at: nowTimestamp) && TimelineParser.matches(sort: $0.sort, episodeNumber: item.episode)
                 })
+            }
+            let subjectImageURL: String? = if let bangumiID, let subjectRow {
+                resolvedImageURL(for: bangumiID, subjectRow: subjectRow)
+            } else {
+                nil
             }
 
             let entry = TimelineEpisodeEntry(
@@ -831,7 +864,7 @@ private enum TimelineMapBuilder {
                 episodeSort: episodeRow?.sort ?? Double(item.episode),
                 episodeName: episodeRow?.name,
                 episodeNameCN: episodeRow?.nameCN,
-                coverImageURL: subjectRow?.imageURL ?? item.coverImageURL,
+                coverImageURL: subjectImageURL ?? item.coverImageURL,
                 isAniListMissing: false
             )
             map[item.dateKey, default: []].append(entry)
@@ -840,6 +873,7 @@ private enum TimelineMapBuilder {
         for item in missingItems {
             guard let subjectRow = subjects[item.bangumiID] else { continue }
             let episodeRows = episodesByBangumiID[item.bangumiID] ?? []
+            let subjectImageURL = resolvedImageURL(for: item.bangumiID, subjectRow: subjectRow)
 
             for episodeRow in episodeRows
             where episodeRow.isValid(at: nowTimestamp) && window.contains(dateString: episodeRow.airdate) {
@@ -855,7 +889,7 @@ private enum TimelineMapBuilder {
                     episodeSort: episodeRow.sort,
                     episodeName: episodeRow.name,
                     episodeNameCN: episodeRow.nameCN,
-                    coverImageURL: subjectRow.imageURL,
+                    coverImageURL: subjectImageURL,
                     isAniListMissing: true
                 )
                 map[dateKey, default: []].append(entry)
@@ -876,7 +910,7 @@ private enum TimelineMapBuilder {
 }
 
 private enum TimelineLogger {
-    static func logDroppedAniListItems(_ items: [TimelineDroppedAniListItem]) {
+    nonisolated static func logDroppedAniListItems(_ items: [TimelineDroppedAniListItem]) {
         guard !items.isEmpty else { return }
 
         for item in items.sorted(by: {
@@ -896,29 +930,33 @@ private enum TimelineLogger {
 }
 
 private enum TimelineParser {
-    static func parseISO8601(_ value: String) -> Date? {
+    nonisolated static func parseISO8601(_ value: String) -> Date? {
         guard !value.isEmpty else { return nil }
-        return ISO8601DateFormatter.withFractional.date(from: value)
-            ?? ISO8601DateFormatter.basic.date(from: value)
+        return TimelineDateFormatterPool.parseISO8601(value)
     }
 
-    static func extractSiteID(named siteName: String, from rawSites: String) -> String? {
-        guard let data = rawSites.data(using: .utf8),
-              let sites = try? JSONDecoder().decode([BgmDataSite].self, from: data) else {
+    nonisolated static func extractSiteID(
+        named siteName: String,
+        from rawSites: String,
+        decoder: JSONDecoder = JSONDecoder()
+    ) -> String? {
+        guard rawSites.contains(siteName),
+              let data = rawSites.data(using: .utf8),
+              let sites = try? decoder.decode([BgmDataSite].self, from: data) else {
             return nil
         }
         return sites.first { $0.site == siteName }?.id
     }
 
-    static func matches(sort: Double, episodeNumber: Int) -> Bool {
+    nonisolated static func matches(sort: Double, episodeNumber: Int) -> Bool {
         abs(sort - Double(episodeNumber)) < 0.0001
     }
 
-    static func dayKey(for airdate: String, calendar: Calendar) -> String {
+    nonisolated static func dayKey(for airdate: String, calendar: Calendar) -> String {
         calendar.timelineDate(from: airdate)?.timelineDayKey(calendar: calendar) ?? airdate
     }
 
-    static func normalizedTitle(_ value: String) -> String {
+    nonisolated static func normalizedTitle(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
 
@@ -941,9 +979,9 @@ private enum TimelineParser {
 }
 
 private extension TimelineBangumiSubjectCacheRow {
-    var imageURL: String? {
+    nonisolated func decodedImageURL(using decoder: JSONDecoder) -> String? {
         guard let data = imagesJSON.data(using: .utf8),
-              let images = try? JSONDecoder().decode(SubjectImages.self, from: data) else {
+              let images = try? decoder.decode(SubjectImages.self, from: data) else {
             return nil
         }
         return images.large.isEmpty ? nil : images.large
@@ -951,43 +989,67 @@ private extension TimelineBangumiSubjectCacheRow {
 }
 
 private extension TimelineBangumiEpisodeCacheRow {
-    func isValid(at timestamp: Int) -> Bool {
+    nonisolated func isValid(at timestamp: Int) -> Bool {
         guard let expiresAt else { return true }
         return expiresAt > timestamp
     }
 }
 
-private extension Calendar {
-    func timelineDate(from airdate: String) -> Date? {
-        guard !airdate.isEmpty else { return nil }
-        let formatter = DateFormatter()
-        formatter.calendar = self
-        formatter.timeZone = timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: airdate)
-    }
-}
-
-private extension Date {
-    func timelineDayKey(calendar: Calendar) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: self)
-    }
-}
-
-private extension ISO8601DateFormatter {
-    static let withFractional: ISO8601DateFormatter = {
+private enum TimelineDateFormatterPool {
+    private nonisolated(unsafe) static let lock = NSLock()
+    private nonisolated(unsafe) static var dayFormattersByTimeZone: [String: DateFormatter] = [:]
+    private nonisolated(unsafe) static let isoWithFractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
-
-    static let basic: ISO8601DateFormatter = {
+    private nonisolated(unsafe) static let isoBasic: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
+
+    nonisolated static func parseISO8601(_ value: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return isoWithFractional.date(from: value) ?? isoBasic.date(from: value)
+    }
+
+    nonisolated static func dayDate(from airdate: String, calendar: Calendar) -> Date? {
+        guard !airdate.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return formatter(for: calendar).date(from: airdate)
+    }
+
+    nonisolated static func dayKey(for date: Date, calendar: Calendar) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return formatter(for: calendar).string(from: date)
+    }
+
+    private nonisolated static func formatter(for calendar: Calendar) -> DateFormatter {
+        let key = calendar.timeZone.identifier
+        if let existing = dayFormattersByTimeZone[key] {
+            return existing
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        dayFormattersByTimeZone[key] = formatter
+        return formatter
+    }
+}
+
+private extension Calendar {
+    nonisolated func timelineDate(from airdate: String) -> Date? {
+        TimelineDateFormatterPool.dayDate(from: airdate, calendar: self)
+    }
+}
+
+private extension Date {
+    nonisolated func timelineDayKey(calendar: Calendar) -> String {
+        TimelineDateFormatterPool.dayKey(for: self, calendar: calendar)
+    }
 }
