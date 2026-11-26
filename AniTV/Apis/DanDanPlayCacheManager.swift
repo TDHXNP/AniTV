@@ -86,7 +86,16 @@ class DanDanPlayCacheManager {
             return false
         }
         let elapsed = Date().timeIntervalSince(lastTime)
-        return elapsed < 2 * 3600 // Within 2 hours
+        return elapsed < 5 * 60 // Within 5 minutes
+    }
+
+    func clearAllCache() {
+        guard let files = try? fileManager.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for file in files {
+            try? fileManager.removeItem(at: file)
+        }
     }
 
     // MARK: - Comments Cache

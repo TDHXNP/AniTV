@@ -9,17 +9,45 @@ import Foundation
 import GRDB
 import SQLiteData
 
+enum SkipOPEDMode: String, CaseIterable, Sendable {
+    case prompt = "prompt"
+    case auto = "auto"
+    case off = "off"
+
+    var displayTitle: String {
+        switch self {
+        case .prompt:
+            return "提示跳过"
+        case .auto:
+            return "自动跳过"
+        case .off:
+            return "关闭"
+        }
+    }
+}
+
 extension AniTVDatabase {
     nonisolated static let playbackCompletionThresholdSettingKey = "player.playback_completion_threshold"
     nonisolated static let defaultPlaybackCompletionThreshold = 0.9
     nonisolated static let autoPlayNextSettingKey = "player.auto_play_next"
     nonisolated static let defaultAutoPlayNext = true
+    nonisolated static let skipOPEDModeSettingKey = "player.skip_oped_mode"
+    nonisolated static let defaultSkipOPEDMode: SkipOPEDMode = .prompt
+    nonisolated static let fallbackOPSkipSecondsSettingKey = "player.fallback_op_skip_seconds"
+    nonisolated static let defaultFallbackOPSkipSeconds = 85
     nonisolated static let rememberDanmakuStateSettingKey = "player.remember_danmaku_state"
     nonisolated static let defaultRememberDanmakuState = true
     nonisolated static let lastDanmakuEnabledSettingKey = "player.last_danmaku_enabled"
     nonisolated static let defaultLastDanmakuEnabled = true
+    nonisolated static let danmakuDisplayAreaSettingKey = "player.danmaku_display_area"
+    nonisolated static let defaultDanmakuDisplayArea = 1.0
+    nonisolated static let danmuApiBaseURLSettingKey = "danmaku.danmu_api_base_url"
+    nonisolated static let defaultDanmuApiBaseURL = "https://danmu.tdhxnp.com/APTX4869"
+    nonisolated static let danmuApiTokenSettingKey = "danmaku.danmu_api_token"
+    nonisolated static let defaultDanmuApiToken = ""
     nonisolated static let playbackSearchConcurrencySettingKey = "media_source.search_concurrency"
     nonisolated static let defaultPlaybackSearchConcurrency = 5
+    nonisolated static let defaultMediaSourceNameSettingKey = "media_source.default_source_name"
     nonisolated static let bangumiOAuthRedirectURISettingKey = "bangumi_oauth_redirect_uri"
     nonisolated static let bangumiOAuthRefreshBlockedSettingKey = "bangumi_oauth_refresh_blocked"
 
@@ -87,6 +115,71 @@ extension AniTVDatabase {
                 valueType: "boolean",
                 in: db
             )
+        }
+        migrator.registerMigration("Seed danmaku display area setting") { db in
+            try upsertSystemSetting(
+                key: danmakuDisplayAreaSettingKey,
+                value: String(defaultDanmakuDisplayArea),
+                valueType: "double",
+                in: db
+            )
+        }
+        migrator.registerMigration("Seed default media source setting") { db in
+            try upsertSystemSetting(
+                key: defaultMediaSourceNameSettingKey,
+                value: "",
+                valueType: "string",
+                in: db
+            )
+        }
+        migrator.registerMigration("Seed skip OP/ED settings") { db in
+            try upsertSystemSetting(
+                key: skipOPEDModeSettingKey,
+                value: defaultSkipOPEDMode.rawValue,
+                valueType: "string",
+                in: db
+            )
+            try upsertSystemSetting(
+                key: fallbackOPSkipSecondsSettingKey,
+                value: String(defaultFallbackOPSkipSeconds),
+                valueType: "integer",
+                in: db
+            )
+        }
+        migrator.registerMigration("Seed danmu_api settings") { db in
+            try upsertSystemSetting(
+                key: danmuApiBaseURLSettingKey,
+                value: defaultDanmuApiBaseURL,
+                valueType: "string",
+                in: db
+            )
+            try upsertSystemSetting(
+                key: danmuApiTokenSettingKey,
+                value: defaultDanmuApiToken,
+                valueType: "string",
+                in: db
+            )
+        }
+        migrator.registerMigration("Populate default danmu_api endpoint if empty") { db in
+            let currentURL = try String.fetchOne(
+                db,
+                sql: "SELECT \"value\" FROM \"system_settings\" WHERE \"key\" = ? LIMIT 1",
+                arguments: [danmuApiBaseURLSettingKey]
+            )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if currentURL.isEmpty {
+                try upsertSystemSetting(
+                    key: danmuApiBaseURLSettingKey,
+                    value: defaultDanmuApiBaseURL,
+                    valueType: "string",
+                    in: db
+                )
+                try upsertSystemSetting(
+                    key: danmuApiTokenSettingKey,
+                    value: defaultDanmuApiToken,
+                    valueType: "string",
+                    in: db
+                )
+            }
         }
     }
 
@@ -292,6 +385,233 @@ extension AniTVDatabase {
             Task {
                 try? await setLastDanmakuEnabled(enabled, in: database)
             }
+        }
+    }
+
+    nonisolated static func danmakuDisplayArea(
+        in database: any DatabaseWriter
+    ) async throws -> Double {
+        let value = try await systemSettingValue(
+            forKey: danmakuDisplayAreaSettingKey,
+            in: database
+        )
+        guard let value, let area = Double(value), area >= 0.1, area <= 1.0 else {
+            return defaultDanmakuDisplayArea
+        }
+        return area
+    }
+
+    nonisolated static func setDanmakuDisplayArea(
+        _ area: Double,
+        in database: any DatabaseWriter
+    ) async throws {
+        let clamped = min(max(area, 0.125), 1.0)
+        UserDefaults.standard.set(clamped, forKey: danmakuDisplayAreaSettingKey)
+        try await database.write { db in
+            try upsertSystemSetting(
+                key: danmakuDisplayAreaSettingKey,
+                value: String(clamped),
+                valueType: "double",
+                in: db
+            )
+        }
+    }
+
+    nonisolated static func resolvedInitialDanmakuDisplayArea() -> CGFloat {
+        if let stored = UserDefaults.standard.object(forKey: danmakuDisplayAreaSettingKey) as? Double,
+           stored >= 0.1, stored <= 1.0 {
+            return CGFloat(stored)
+        }
+        return CGFloat(defaultDanmakuDisplayArea)
+    }
+
+    nonisolated static func persistDanmakuDisplayArea(
+        _ area: CGFloat,
+        in database: (any DatabaseWriter)?
+    ) {
+        let clamped = min(max(Double(area), 0.125), 1.0)
+        UserDefaults.standard.set(clamped, forKey: danmakuDisplayAreaSettingKey)
+        if let database {
+            Task {
+                try? await setDanmakuDisplayArea(clamped, in: database)
+            }
+        }
+    }
+
+    nonisolated static func syncDanmakuSettingsToUserDefaults(
+        in database: any DatabaseWriter
+    ) async {
+        do {
+            let remember = try await isRememberDanmakuStateEnabled(in: database)
+            let lastEnabled = try await isLastDanmakuEnabled(in: database)
+            let displayArea = try await danmakuDisplayArea(in: database)
+            let baseURL = try await danmuApiBaseURL(in: database)
+            let token = try await danmuApiToken(in: database)
+            UserDefaults.standard.set(remember, forKey: rememberDanmakuStateSettingKey)
+            UserDefaults.standard.set(lastEnabled, forKey: lastDanmakuEnabledSettingKey)
+            UserDefaults.standard.set(displayArea, forKey: danmakuDisplayAreaSettingKey)
+            UserDefaults.standard.set(baseURL, forKey: danmuApiBaseURLSettingKey)
+            UserDefaults.standard.set(token, forKey: danmuApiTokenSettingKey)
+        } catch {
+            print("[SystemSettingsTable] Failed to sync danmaku settings to UserDefaults: \(error)")
+        }
+    }
+
+    nonisolated static func danmuApiBaseURL(
+        in database: any DatabaseWriter
+    ) async throws -> String {
+        let value = try await systemSettingValue(
+            forKey: danmuApiBaseURLSettingKey,
+            in: database
+        )?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let value, !value.isEmpty {
+            return value
+        }
+        return defaultDanmuApiBaseURL
+    }
+
+    nonisolated static func setDanmuApiBaseURL(
+        _ baseURL: String,
+        in database: any DatabaseWriter
+    ) async throws {
+        let normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(normalized, forKey: danmuApiBaseURLSettingKey)
+        try await database.write { db in
+            try upsertSystemSetting(
+                key: danmuApiBaseURLSettingKey,
+                value: normalized,
+                valueType: "string",
+                in: db
+            )
+        }
+    }
+
+    nonisolated static func danmuApiToken(
+        in database: any DatabaseWriter
+    ) async throws -> String {
+        let value = try await systemSettingValue(
+            forKey: danmuApiTokenSettingKey,
+            in: database
+        )?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value ?? defaultDanmuApiToken
+    }
+
+    nonisolated static func setDanmuApiToken(
+        _ token: String,
+        in database: any DatabaseWriter
+    ) async throws {
+        let normalized = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(normalized, forKey: danmuApiTokenSettingKey)
+        try await database.write { db in
+            try upsertSystemSetting(
+                key: danmuApiTokenSettingKey,
+                value: normalized,
+                valueType: "string",
+                in: db
+            )
+        }
+    }
+
+    nonisolated static func resolvedDanmuApiBaseURL() -> String {
+        let stored = UserDefaults.standard.string(forKey: danmuApiBaseURLSettingKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let stored, !stored.isEmpty {
+            return stored
+        }
+        return defaultDanmuApiBaseURL
+    }
+
+    nonisolated static func resolvedDanmuApiToken() -> String {
+        if let stored = UserDefaults.standard.string(forKey: danmuApiTokenSettingKey) {
+            return stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return defaultDanmuApiToken
+    }
+
+    nonisolated static func defaultMediaSourceName(
+        in database: any DatabaseWriter
+    ) async throws -> String? {
+        let value = try await systemSettingValue(
+            forKey: defaultMediaSourceNameSettingKey,
+            in: database
+        )?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+
+    nonisolated static func setDefaultMediaSourceName(
+        _ name: String?,
+        in database: any DatabaseWriter
+    ) async throws {
+        let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        try await database.write { db in
+            try upsertSystemSetting(
+                key: defaultMediaSourceNameSettingKey,
+                value: normalized,
+                valueType: "string",
+                in: db
+            )
+        }
+    }
+
+    nonisolated static func skipOPEDMode(
+        in database: any DatabaseWriter
+    ) async throws -> SkipOPEDMode {
+        let value = try await systemSettingValue(
+            forKey: skipOPEDModeSettingKey,
+            in: database
+        )
+        guard let value, let mode = SkipOPEDMode(rawValue: value) else {
+            return defaultSkipOPEDMode
+        }
+        return mode
+    }
+
+    nonisolated static func setSkipOPEDMode(
+        _ mode: SkipOPEDMode,
+        in database: any DatabaseWriter
+    ) async throws {
+        UserDefaults.standard.set(mode.rawValue, forKey: skipOPEDModeSettingKey)
+        try await database.write { db in
+            try upsertSystemSetting(
+                key: skipOPEDModeSettingKey,
+                value: mode.rawValue,
+                valueType: "string",
+                in: db
+            )
+        }
+    }
+
+    nonisolated static func fallbackOPSkipSeconds(
+        in database: any DatabaseWriter
+    ) async throws -> Int {
+        let value = try await systemSettingValue(
+            forKey: fallbackOPSkipSecondsSettingKey,
+            in: database
+        )
+        guard let value, let seconds = Int(value), seconds >= 30, seconds <= 240 else {
+            return defaultFallbackOPSkipSeconds
+        }
+        return seconds
+    }
+
+    nonisolated static func setFallbackOPSkipSeconds(
+        _ seconds: Int,
+        in database: any DatabaseWriter
+    ) async throws {
+        let clamped = min(max(seconds, 30), 240)
+        UserDefaults.standard.set(clamped, forKey: fallbackOPSkipSecondsSettingKey)
+        try await database.write { db in
+            try upsertSystemSetting(
+                key: fallbackOPSkipSecondsSettingKey,
+                value: String(clamped),
+                valueType: "integer",
+                in: db
+            )
         }
     }
 
