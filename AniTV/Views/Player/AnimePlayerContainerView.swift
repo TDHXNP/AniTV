@@ -149,6 +149,7 @@ struct AnimePlayerContainerView: View {
     @State private var fetchSourcesTask: Task<Void, Never>?
     @State private var playbackTask: Task<Void, Never>?
     @State private var lastPlaybackPosition: CMTime?
+    @State private var isApplyingResumeSeek = false
     @State private var mediaResolver = TVOSMediaResolver.shared
     @StateObject private var sourcePanelModel = SourceSwitchPanelModel()
     @State private var currentBgmUserID: Int?
@@ -163,26 +164,169 @@ struct AnimePlayerContainerView: View {
     @State private var statusObservation: NSKeyValueObservation?
     @State private var danmuManager: DanmuViewManager?
     @State private var isDanmakuAvailable = true
+    @State private var defaultMediaSourceName: String?
+    @State private var isWaitingForDefaultSource = false
+    @State private var skipOPEDMode: SkipOPEDMode = AniTVDatabase.defaultSkipOPEDMode
+    @State private var fallbackOPSkipSeconds: Int = AniTVDatabase.defaultFallbackOPSkipSeconds
+    @State private var episodeSkipPlan: EpisodeSkipPlan = .empty
+    @State private var activeSkipAction: PlayerSkipContextualAction?
+    @State private var skippedSegmentKinds: Set<SkipSegmentKind> = []
+    @State private var skipTimeObserver: Any?
+    @State private var skipPlanTask: Task<Void, Never>?
+    @State private var skipToastMessage: String?
+    @State private var skipToastTask: Task<Void, Never>?
 
     let episodeInfo: BgmEpisodeInfo
+    let episodes: [BgmEpisodeInfo]
     let sessionTitle: String
     let initialPlaybackPositionSeconds: Int?
+    var onSelectEpisode: ((BgmEpisodeInfo) -> Void)? = nil
     var onPlaybackCompleted: (() -> Void)? = nil
     var onExitRequest: (() -> Void)? = nil
     @State private var text = "正在解析番剧源..."
 
     init(
         episodeInfo: BgmEpisodeInfo,
+        episodes: [BgmEpisodeInfo] = [],
         sessionTitle: String,
         initialPlaybackPositionSeconds: Int? = nil,
+        onSelectEpisode: ((BgmEpisodeInfo) -> Void)? = nil,
         onPlaybackCompleted: (() -> Void)? = nil,
         onExitRequest: (() -> Void)? = nil
     ) {
         self.episodeInfo = episodeInfo
+        self.episodes = episodes
         self.sessionTitle = sessionTitle
         self.initialPlaybackPositionSeconds = initialPlaybackPositionSeconds
+        self.onSelectEpisode = onSelectEpisode
         self.onPlaybackCompleted = onPlaybackCompleted
         self.onExitRequest = onExitRequest
+    }
+
+    private var episodeLabel: String {
+        let value = episodeInfo.ep > 0 ? episodeInfo.ep : episodeInfo.sort
+        if value.rounded() == value {
+            return "第 \(Int(value)) 集"
+        }
+        return "第 \(value) 集"
+    }
+
+    private var hasNextEpisode: Bool {
+        guard let currentIndex = episodes.firstIndex(where: { $0.id == episodeInfo.id }) else {
+            return false
+        }
+        return episodes.indices.contains(currentIndex + 1)
+    }
+
+    private var nextEpisode: BgmEpisodeInfo? {
+        guard let currentIndex = episodes.firstIndex(where: { $0.id == episodeInfo.id }) else {
+            return nil
+        }
+        let nextIndex = currentIndex + 1
+        return episodes.indices.contains(nextIndex) ? episodes[nextIndex] : nil
+    }
+
+    private var resolvedEpisodeNumberForAniSkip: Int {
+        let value = episodeInfo.ep > 0 ? episodeInfo.ep : episodeInfo.sort
+        return max(0, Int(value.rounded()))
+    }
+
+    nonisolated static func resolveResumePosition(
+        currentItemStatus: AVPlayerItem.Status?,
+        currentPlayerTime: CMTime?,
+        lastPlaybackPosition: CMTime?,
+        isApplyingResumeSeek: Bool
+    ) -> CMTime? {
+        if !isApplyingResumeSeek,
+           currentItemStatus == .readyToPlay,
+           let currentPlayerTime {
+            return currentPlayerTime
+        }
+        return lastPlaybackPosition
+    }
+
+    nonisolated static func subtitleLanguageSortPriority(
+        text: String,
+        subtitleLanguageIds: [String] = []
+    ) -> Int {
+        let lower = text.lowercased()
+        let tokens = Set(lower.components(separatedBy: CharacterSet.alphanumerics.inverted))
+        let upperIDs = Set(subtitleLanguageIds.map { $0.uppercased() })
+
+        let simplifiedMarkers = ["简中", "簡中", "简体", "簡體", "简日", "簡日", "简字", "簡字", "中简", "中簡", "zh-hans", "zh_hans"]
+        let traditionalMarkers = ["繁中", "繁体", "繁體", "繁日", "繁字", "中繁", "zh-hant", "zh_hant", "big5"]
+
+        let hasSimplified = upperIDs.contains("CHS")
+            || simplifiedMarkers.contains { lower.contains($0) }
+            || tokens.contains("chs")
+        let hasTraditional = upperIDs.contains("CHT")
+            || traditionalMarkers.contains { lower.contains($0) }
+            || tokens.contains("cht")
+
+        if hasSimplified && !hasTraditional {
+            return 0 // 纯简中优先
+        }
+        if hasSimplified && hasTraditional {
+            return 1 // 简繁双语其次
+        }
+        if hasTraditional {
+            return 3 // 繁中排在简中与未标注线路之后
+        }
+        return 2 // 未标注语言保持原有相对顺序
+    }
+
+    nonisolated static func prioritizedMediaSourceConfigs(
+        _ configs: [MediaSourceConfig],
+        defaultSourceName: String?
+    ) -> [MediaSourceConfig] {
+        let normalizedDefault = defaultSourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var pinned: MediaSourceConfig?
+        var remaining: [(offset: Int, config: MediaSourceConfig)] = []
+
+        for (index, config) in configs.enumerated() {
+            if pinned == nil,
+               let normalizedDefault,
+               !normalizedDefault.isEmpty,
+               config.arguments?.name == normalizedDefault {
+                pinned = config
+            } else {
+                remaining.append((index, config))
+            }
+        }
+
+        let sortedRemaining = remaining.sorted { lhs, rhs in
+            let lhsPriority = subtitleLanguageSortPriority(text: lhs.config.arguments?.name ?? "")
+            let rhsPriority = subtitleLanguageSortPriority(text: rhs.config.arguments?.name ?? "")
+            if lhsPriority != rhsPriority {
+                return lhsPriority < rhsPriority
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.config)
+
+        if let pinned {
+            return [pinned] + sortedRemaining
+        }
+        return sortedRemaining
+    }
+
+    nonisolated static func prioritizedMediaMatches(_ matches: [MediaMatch]) -> [MediaMatch] {
+        matches.enumerated().sorted { lhs, rhs in
+            let lhsText = "\(lhs.element.media.properties.alliance) \(lhs.element.media.originalTitle)"
+            let rhsText = "\(rhs.element.media.properties.alliance) \(rhs.element.media.originalTitle)"
+            let lhsPriority = subtitleLanguageSortPriority(
+                text: lhsText,
+                subtitleLanguageIds: lhs.element.media.properties.subtitleLanguageIds
+            )
+            let rhsPriority = subtitleLanguageSortPriority(
+                text: rhsText,
+                subtitleLanguageIds: rhs.element.media.properties.subtitleLanguageIds
+            )
+            if lhsPriority != rhsPriority {
+                return lhsPriority < rhsPriority
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
     }
 
     var body: some View {
@@ -190,27 +334,88 @@ struct AnimePlayerContainerView: View {
             AdvancedVideoPlayer(
                 player: player,
                 title: sessionTitle,
-                sort: Int(episodeInfo.sort),
+                episodes: episodes.isEmpty ? [episodeInfo] : episodes,
+                currentEpisode: episodeInfo,
                 availableSources: videoSources,
                 isSourcePanelPresented: $isSourcePanelPresented,
                 danmuManager: danmuManager,
                 isDanmakuAvailable: isDanmakuAvailable,
+                activeSkipAction: activeSkipAction,
+                skipOPEDMode: skipOPEDMode,
+                skipPlanSourceDescription: episodeSkipPlan.sourceDescription,
+                hasCustomSkipPreference: episodeSkipPlan.hasCustomPreference,
+                fallbackOPSkipSeconds: fallbackOPSkipSeconds,
                 onExitRequest: onExitRequest,
+                onSelectEpisode: onSelectEpisode,
                 onDanmakuToggled: { newEnabled in
                     AniTVDatabase.persistDanmakuStateIfRememberEnabled(newEnabled, in: database)
                 },
+                onDanmakuDisplayAreaChanged: { newArea in
+                    AniTVDatabase.persistDanmakuDisplayArea(newArea, in: database)
+                },
+                onPerformSkipAction: handlePerformSkipAction,
+                onChangeSkipMode: handleChangeSkipOPEDMode,
+                onManualFallbackSkipOP: handleManualFallbackSkipOP,
+                onRememberCurrentAsOPEnd: handleRememberCurrentAsOPEnd,
+                onClearCustomSkipPreference: handleClearCustomSkipPreference,
                 onSourceSelected: handleUserSelectedResource
             )
                 .ignoresSafeArea()
 
-            if isSourcePanelPresented {
-                VStack(spacing: 0) {
-                    SourcePanelOverlayContainer(model: sourcePanelModel)
-                    .id(sourcePanelPresentationID)
-                    .frame(width: 1760, height: 360)
-                    .padding(.top, 0)
+            if let skipToastMessage {
+                VStack {
+                    HStack {
+                        Spacer()
+                        HStack(spacing: 10) {
+                            Image(systemName: "forward.end.fill")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundStyle(Color.cyan)
 
-                    Spacer(minLength: 0)
+                            Text(skipToastMessage)
+                                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 12)
+                        .background(
+                            Capsule()
+                                .fill(.ultraThinMaterial)
+                                .overlay(Capsule().fill(Color.black.opacity(0.45)))
+                        )
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.22), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.35), radius: 14, y: 6)
+                        .padding(.top, 52)
+                        .padding(.trailing, 64)
+                    }
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(2)
+            }
+
+            if isSourcePanelPresented {
+                ZStack(alignment: .top) {
+                    LinearGradient(
+                        colors: [
+                            Color.black.opacity(0.68),
+                            Color.black.opacity(0.32),
+                            Color.clear
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 640)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+
+                    SourcePanelOverlayContainer(model: sourcePanelModel)
+                        .id(sourcePanelPresentationID)
+                        .frame(width: 1180, height: 476)
+                        .padding(.top, 44)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -254,6 +459,10 @@ struct AnimePlayerContainerView: View {
             isAttemptingPlayback = false
             didFinishPlayback = false
             didSyncCompletionToBangumi = false
+            skippedSegmentKinds = []
+            activeSkipAction = nil
+            episodeSkipPlan = .empty
+            isApplyingResumeSeek = false
             if let initialPlaybackPositionSeconds, initialPlaybackPositionSeconds > 0 {
                 lastPlaybackPosition = CMTime(
                     seconds: Double(initialPlaybackPositionSeconds),
@@ -266,10 +475,15 @@ struct AnimePlayerContainerView: View {
             configurePlaybackProgressTracking()
             sourcePanelModel.update(
                 sources: videoSources,
-                onSourceSelected: handleUserSelectedResource
+                sessionTitle: sessionTitle,
+                episodeLabel: episodeLabel,
+                defaultSourceName: defaultMediaSourceName,
+                onSourceSelected: handleUserSelectedResource,
+                onSetDefaultSource: handleSetDefaultMediaSource
             )
             Task {
                 await loadPlaybackPersistenceContext()
+                loadSkipPlan()
             }
             fetchSourcesTask?.cancel()
             fetchSourcesTask = Task { @MainActor in
@@ -283,6 +497,10 @@ struct AnimePlayerContainerView: View {
             fetchSourcesTask = nil
             playbackTask?.cancel()
             playbackTask = nil
+            skipPlanTask?.cancel()
+            skipPlanTask = nil
+            skipToastTask?.cancel()
+            skipToastTask = nil
             Task { @MainActor in
                 mediaResolver.cancelResolve()
             }
@@ -294,6 +512,13 @@ struct AnimePlayerContainerView: View {
             statusObservation = nil
             removePlaybackProgressTracking()
             cleanup()
+        }
+    }
+
+    private func handleSetDefaultMediaSource(_ name: String?) {
+        defaultMediaSourceName = name
+        Task {
+            try? await AniTVDatabase.setDefaultMediaSourceName(name, in: database)
         }
     }
 
@@ -325,6 +550,9 @@ struct AnimePlayerContainerView: View {
 
     private func attemptNextQueuedResourceIfNeeded() {
         guard !hasUserSelectedSource, !hasResolvedAutoPlayback, !isAttemptingPlayback else { return }
+        if isWaitingForDefaultSource {
+            return
+        }
 
         while !queuedVideoResources.isEmpty {
             let next = queuedVideoResources.removeFirst()
@@ -355,47 +583,74 @@ struct AnimePlayerContainerView: View {
             )
             queuedVideoResourceKeys.insert(key)
         }
+        queuedVideoResources.sort { lhs, rhs in
+            if lhs.sourceIndex != rhs.sourceIndex {
+                return lhs.sourceIndex < rhs.sourceIndex
+            }
+            return lhs.resourceIndex < rhs.resourceIndex
+        }
     }
 
     private func onSwitch(resource: VideoResource, isUserInitiated: Bool){
         playbackTask = Task { @MainActor in
-            let currentTime = player.currentTime()
-            let currentItemStatus = player.currentItem?.status
-            let validCurrentTime = validatedPlaybackPosition(from: currentTime)
-            let resumeTime: CMTime?
-
-            if currentItemStatus != .failed, let validCurrentTime {
-                resumeTime = validCurrentTime
-                lastPlaybackPosition = validCurrentTime
-            } else {
-                resumeTime = lastPlaybackPosition
+            let validCurrentTime = validatedPlaybackPosition(from: player.currentTime())
+            let resumeTime = Self.resolveResumePosition(
+                currentItemStatus: player.currentItem?.status,
+                currentPlayerTime: validCurrentTime,
+                lastPlaybackPosition: lastPlaybackPosition,
+                isApplyingResumeSeek: isApplyingResumeSeek
+            )
+            if let resumeTime {
+                lastPlaybackPosition = resumeTime
             }
             mediaResolver.cancelResolve()
             print("解析地址: \(resource.url)")
-            var link: ExtractionResult
-            do {
-                link = try await mediaResolver.resolve(pageUrl: resource.url, config: resource.matchConfig)
-                print("🎉 最终 m3u8 直链: \(link.m3u8Url)")
-                print("📋 请求头: \(link.headers)")
-                print("🍪 Cookies: \(link.cookieString)")
-            }catch {
-                if error is CancellationError {
+            let playerItem: AVPlayerItem
+            if let directURL = resource.directPlayURL {
+                print("🎬 本地媒体源直连播放 URL: \(directURL)")
+                if resource.directHeaders.isEmpty {
+                    playerItem = AVPlayerItem(url: directURL)
+                } else {
+                    let asset = AVURLAsset(
+                        url: directURL,
+                        options: ["AVURLAssetHTTPHeaderFieldsKey": resource.directHeaders]
+                    )
+                    playerItem = AVPlayerItem(asset: asset)
+                }
+            } else {
+                guard let matchConfig = resource.matchConfig else {
+                    isAttemptingPlayback = false
+                    sourcePanelModel.markPendingSelectionResolveFailed()
+                    if !isUserInitiated {
+                        attemptNextQueuedResourceIfNeeded()
+                    }
                     return
                 }
-                print("❌ 解析失败或超时: \(error.localizedDescription)")
-                isAttemptingPlayback = false
-                sourcePanelModel.markPendingSelectionResolveFailed()
-                if !isUserInitiated {
-                    attemptNextQueuedResourceIfNeeded()
+                var link: ExtractionResult
+                do {
+                    link = try await mediaResolver.resolve(pageUrl: resource.url, config: matchConfig)
+                    print("🎉 最终 m3u8 直链: \(link.m3u8Url)")
+                    print("📋 请求头: \(link.headers)")
+                    print("🍪 Cookies: \(link.cookieString)")
+                } catch {
+                    if error is CancellationError {
+                        return
+                    }
+                    print("❌ 解析失败或超时: \(error.localizedDescription)")
+                    isAttemptingPlayback = false
+                    sourcePanelModel.markPendingSelectionResolveFailed()
+                    if !isUserInitiated {
+                        attemptNextQueuedResourceIfNeeded()
+                    }
+                    return
                 }
-                return
+
+                let prepared = await LocalHlsPlaybackPreparer.shared.prepare(url: link.m3u8Url, headers: link.headers)
+                print("🎬 播放目标 URL: \(prepared.playUrl)")
+                playerItem = AVPlayerItem(url: prepared.playUrl)
             }
-                        
-            
-            let prepared = await LocalHlsPlaybackPreparer.shared.prepare(url: link.m3u8Url, headers: link.headers)
-            print("🎬 播放目标 URL: \(prepared.playUrl)")
-            let playerItem = AVPlayerItem(url: prepared.playUrl)
             playerItem.externalMetadata = createMetadata()
+            var didHandleReadyToPlay = false
             
             // 💥 2. 把返回的监听器赋值给 State 变量
             statusObservation = playerItem.observe(\.status, options: [.new, .initial]) { item, _ in
@@ -408,23 +663,40 @@ struct AnimePlayerContainerView: View {
                         }
                         text = "播放失败"
                         isAttemptingPlayback = false
+                        isApplyingResumeSeek = false
                         sourcePanelModel.markPendingSelectionPlaybackFailed()
                         if !isUserInitiated {
                             attemptNextQueuedResourceIfNeeded()
                         }
                     } else if item.status == .readyToPlay {
+                        guard !didHandleReadyToPlay else { return }
+                        didHandleReadyToPlay = true
                         print("✅ 准备就绪，可以播放")
                         isLoading = false
                         isAttemptingPlayback = false
                         hasResolvedAutoPlayback = true
                         sourcePanelModel.confirmPendingSelection()
                         isSourcePanelPresented = false
-                        if let resumeTime {
-                            lastPlaybackPosition = resumeTime
-                            player.seek(to: resumeTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
-                                player.play()
+                        if let resumeTime, resumeTime.seconds > 0 {
+                            let targetResumeTime: CMTime
+                            if let itemDuration = validatedPlaybackPosition(from: item.duration),
+                               itemDuration.seconds > 2 {
+                                let clampedSeconds = min(resumeTime.seconds, itemDuration.seconds - 1)
+                                targetResumeTime = CMTime(seconds: max(0, clampedSeconds), preferredTimescale: 600)
+                            } else {
+                                targetResumeTime = resumeTime
+                            }
+                            lastPlaybackPosition = targetResumeTime
+                            isApplyingResumeSeek = true
+                            print("⏩ 续播定位至 \(Int(targetResumeTime.seconds)) 秒")
+                            player.seek(to: targetResumeTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+                                DispatchQueue.main.async {
+                                    isApplyingResumeSeek = false
+                                    player.play()
+                                }
                             }
                         } else {
+                            isApplyingResumeSeek = false
                             player.play()
                         }
                     } else if item.status == .unknown {
@@ -437,117 +709,189 @@ struct AnimePlayerContainerView: View {
         }
     }
 
-    private func doFetch() async -> URL?{
+    private enum UnifiedFetchSource {
+        case local(LocalMediaSourceConfig)
+        case remote(MediaSourceConfig)
+
+        var displayName: String {
+            switch self {
+            case .local(let config):
+                return config.name
+            case .remote(let config):
+                return config.arguments?.name ?? "Unknown Source"
+            }
+        }
+    }
+
+    private func doFetch() async -> URL? {
         guard !Task.isCancelled else { return nil }
-        let configs: [MediaSourceConfig]
+        let localSources = (try? await AniTVDatabase.fetchLocalMediaSources(enabledOnly: true, in: database)) ?? []
+        let rawConfigs: [MediaSourceConfig]
         do {
-            configs = try await AniTVDatabase.fetchMediaSourceConfigs(in: database)
+            rawConfigs = try await AniTVDatabase.fetchMediaSourceConfigs(in: database)
         } catch {
             print("[AnimePlayer] Failed to load media sources from database: \(error)")
-            videoSources = []
-            sourcePanelModel.update(
-                sources: videoSources,
-                onSourceSelected: handleUserSelectedResource
-            )
-            sourcePanelModel.setLoadingSources(Set<Int>())
-            return nil
+            rawConfigs = []
         }
 
-        guard !configs.isEmpty else {
+        guard !localSources.isEmpty || !rawConfigs.isEmpty else {
             print("[AnimePlayer] No media sources available in database")
             videoSources = []
             sourcePanelModel.update(
                 sources: videoSources,
-                onSourceSelected: handleUserSelectedResource
+                sessionTitle: sessionTitle,
+                episodeLabel: episodeLabel,
+                defaultSourceName: defaultMediaSourceName,
+                onSourceSelected: handleUserSelectedResource,
+                onSetDefaultSource: handleSetDefaultMediaSource
             )
             sourcePanelModel.setLoadingSources(Set<Int>())
             return nil
         }
 
-        let indexedConfigs = Array(configs.enumerated())
+        let configuredConcurrency = (try? await AniTVDatabase.playbackSearchConcurrency(in: database)) ?? sourceFetchConcurrency
+        let effectiveConcurrency = max(1, configuredConcurrency)
+        let savedDefaultSourceName = try? await AniTVDatabase.defaultMediaSourceName(in: database)
+        defaultMediaSourceName = savedDefaultSourceName
 
-        videoSources = configs.enumerated().map { index, config in
-            VideoSource(
-                sourceName: config.arguments?.name ?? "Source \(index)",
-                resources: []
-            )
+        let orderedRemoteConfigs = Self.prioritizedMediaSourceConfigs(rawConfigs, defaultSourceName: savedDefaultSourceName)
+        var unifiedSources: [UnifiedFetchSource] =
+            localSources.map { .local($0) } + orderedRemoteConfigs.map { .remote($0) }
+
+        if let savedDefaultSourceName, !savedDefaultSourceName.isEmpty,
+           let preferredIndex = unifiedSources.firstIndex(where: { $0.displayName == savedDefaultSourceName }),
+           preferredIndex > 0 {
+            let preferred = unifiedSources.remove(at: preferredIndex)
+            unifiedSources.insert(preferred, at: 0)
+        }
+
+        let hasPinnedDefaultSourceAtZero: Bool = {
+            guard let savedDefaultSourceName, !savedDefaultSourceName.isEmpty else { return false }
+            return unifiedSources.first?.displayName == savedDefaultSourceName
+        }()
+        isWaitingForDefaultSource = hasPinnedDefaultSourceAtZero
+
+        let indexedSources = Array(unifiedSources.enumerated())
+
+        videoSources = unifiedSources.enumerated().map { index, source in
+            let fallbackName = "Source \(index)"
+            let name = source.displayName.isEmpty ? fallbackName : source.displayName
+            return VideoSource(sourceName: name, resources: [])
         }
         sourcePanelModel.update(
             sources: videoSources,
-            onSourceSelected: handleUserSelectedResource
+            sessionTitle: sessionTitle,
+            episodeLabel: episodeLabel,
+            defaultSourceName: savedDefaultSourceName,
+            onSourceSelected: handleUserSelectedResource,
+            onSetDefaultSource: handleSetDefaultMediaSource
         )
-        sourcePanelModel.setLoadingSources(Set(indexedConfigs.map(\.0)))
+        sourcePanelModel.setLoadingSources(Set(indexedSources.map(\.0)))
 
-        for batchStart in stride(from: 0, to: indexedConfigs.count, by: sourceFetchConcurrency) {
+        let localSearchEpisodeNumber = max(1, resolvedEpisodeNumberForAniSkip)
+        let bangumiInfo = try? await AniTVDatabase.bangumiMalLookupInfo(
+            forBangumiID: String(episodeInfo.subjectId),
+            in: database
+        )
+        let localSearchTitles = [sessionTitle, bangumiInfo?.originalTitle ?? ""]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for batchStart in stride(from: 0, to: indexedSources.count, by: effectiveConcurrency) {
             guard !Task.isCancelled else { return nil }
-            let batchEnd = min(batchStart + sourceFetchConcurrency, indexedConfigs.count)
-            let batch = Array(indexedConfigs[batchStart..<batchEnd])
+            let batchEnd = min(batchStart + effectiveConcurrency, indexedSources.count)
+            let batch = Array(indexedSources[batchStart..<batchEnd])
 
-            let batchResults = await withTaskGroup(of: (Int, [VideoResource]).self) { group in
-                for (index, config) in batch {
+            await withTaskGroup(of: (Int, [VideoResource]).self) { group in
+                for (index, unifiedSource) in batch {
                     group.addTask {
                         guard !Task.isCancelled else { return (index, []) }
-                        print("get lines: \(config.arguments?.name ?? "UNKNOWN SOURCE \(index)")")
-                        let mediaSource = SelectorMediaSource(
-                            mediaSourceId: "1",
-                            config: config,
-                            repository: SelectorMediaSourceEpisodeCacheRepository(),
-                            client: URLSessionHTTPClient()
-                        )
-                        print(episodeInfo.name)
-                        let result = await mediaSource.fetch(query: MediaFetchRequest(
-                            subjectId: "\(episodeInfo.subjectId)",
-                            episodeId: "\(episodeInfo.id)",
-                            subjectNameCN: sessionTitle,
-                            subjectNames: [sessionTitle],
-                            episodeSort: .normal(number: Float(Int(episodeInfo.sort))),
-                            episodeName: "\(episodeInfo.nameCN)",
-                            episodeEp: .normal(number: Float(Int(episodeInfo.ep)))
-                        ))
-
-                        // 线路选择面板优先选择 session title exact match 的项目
-                        let exactMatchedItems = result.filter {
-                            $0.media.properties.subjectName == sessionTitle
-                        }
-                        let displayedItems = exactMatchedItems.isEmpty ? result : exactMatchedItems
-
-                        let resources = displayedItems.map {
-                            VideoResource(
-                                resourceName: $0.media.properties.alliance,
-                                url: $0.media.originalUrl,
-                                matchConfig: (config.arguments?.searchConfig.matchVideo)!
+                        switch unifiedSource {
+                        case .local(let localConfig):
+                            let matches = await LocalMediaServerClient.shared.searchEpisode(
+                                source: localConfig,
+                                subjectTitles: localSearchTitles,
+                                episodeNumber: localSearchEpisodeNumber
                             )
+                            let resources = matches.map { match in
+                                VideoResource(
+                                    resourceName: match.displayName,
+                                    url: match.streamURL.absoluteString,
+                                    matchConfig: nil,
+                                    directPlayURL: match.streamURL,
+                                    directHeaders: match.headers
+                                )
+                            }
+                            return (index, resources)
+
+                        case .remote(let config):
+                            print("get lines: \(config.arguments?.name ?? "UNKNOWN SOURCE \(index)")")
+                            let mediaSource = SelectorMediaSource(
+                                mediaSourceId: "1",
+                                config: config,
+                                repository: SelectorMediaSourceEpisodeCacheRepository(),
+                                client: URLSessionHTTPClient()
+                            )
+                            print(episodeInfo.name)
+                            let result = await mediaSource.fetch(query: MediaFetchRequest(
+                                subjectId: "\(episodeInfo.subjectId)",
+                                episodeId: "\(episodeInfo.id)",
+                                subjectNameCN: sessionTitle,
+                                subjectNames: [sessionTitle],
+                                episodeSort: .normal(number: Float(Int(episodeInfo.sort))),
+                                episodeName: "\(episodeInfo.nameCN)",
+                                episodeEp: .normal(number: Float(Int(episodeInfo.ep)))
+                            ))
+
+                            // 线路选择面板优先选择 session title exact match 的项目，并将简中线路排在繁中上面
+                            let exactMatchedItems = result.filter {
+                                $0.media.properties.subjectName == sessionTitle
+                            }
+                            let baseItems = exactMatchedItems.isEmpty ? result : exactMatchedItems
+                            let displayedItems = Self.prioritizedMediaMatches(baseItems)
+
+                            guard let matchConfig = config.arguments?.searchConfig.matchVideo else {
+                                return (index, [])
+                            }
+
+                            let resources = displayedItems.map {
+                                VideoResource(
+                                    resourceName: $0.media.properties.alliance,
+                                    url: $0.media.originalUrl,
+                                    matchConfig: matchConfig
+                                )
+                            }
+                            return (index, resources)
                         }
-                        return (index, resources)
                     }
                 }
 
-                var collected: [(Int, [VideoResource])] = []
-                for await item in group {
+                for await (index, resources) in group {
                     guard !Task.isCancelled else {
                         group.cancelAll()
-                        return collected
+                        return
                     }
-                    collected.append(item)
+                    guard videoSources.indices.contains(index) else { continue }
+                    videoSources[index] = VideoSource(
+                        sourceName: videoSources[index].sourceName,
+                        resources: resources
+                    )
+                    sourcePanelModel.markSourceLoaded(index)
+                    enqueueResources(resources, forSourceIndex: index)
+                    if index == 0 && isWaitingForDefaultSource {
+                        isWaitingForDefaultSource = false
+                    }
+                    sourcePanelModel.update(
+                        sources: videoSources,
+                        onSourceSelected: handleUserSelectedResource
+                    )
+                    attemptNextQueuedResourceIfNeeded()
                 }
-                return collected
             }
+        }
 
-            guard !Task.isCancelled else { return nil }
-            for (index, resources) in batchResults.sorted(by: { $0.0 < $1.0 }) {
-                guard videoSources.indices.contains(index) else { continue }
-                videoSources[index] = VideoSource(
-                    sourceName: videoSources[index].sourceName,
-                    resources: resources
-                )
-                sourcePanelModel.markSourceLoaded(index)
-                enqueueResources(resources, forSourceIndex: index)
-            }
-
-            sourcePanelModel.update(
-                sources: videoSources,
-                onSourceSelected: handleUserSelectedResource
-            )
+        if isWaitingForDefaultSource {
+            isWaitingForDefaultSource = false
             attemptNextQueuedResourceIfNeeded()
         }
         return nil
@@ -608,11 +952,216 @@ struct AnimePlayerContainerView: View {
             let profile = try await AniTVDatabase.currentUserProfile(in: database)
             currentBgmUserID = profile?.effectiveBgmUserID
             playbackCompletionThreshold = try await AniTVDatabase.playbackCompletionThreshold(in: database)
+            skipOPEDMode = try await AniTVDatabase.skipOPEDMode(in: database)
+            fallbackOPSkipSeconds = try await AniTVDatabase.fallbackOPSkipSeconds(in: database)
         } catch {
             currentBgmUserID = nil
             playbackCompletionThreshold = AniTVDatabase.defaultPlaybackCompletionThreshold
+            skipOPEDMode = AniTVDatabase.defaultSkipOPEDMode
+            fallbackOPSkipSeconds = AniTVDatabase.defaultFallbackOPSkipSeconds
             print("Failed to load playback persistence context: \(error)")
         }
+    }
+
+    private func loadSkipPlan() {
+        skipPlanTask?.cancel()
+        let subjectID = episodeInfo.subjectId
+        let epNumber = resolvedEpisodeNumberForAniSkip
+        let title = sessionTitle
+        let durationSeconds = resolvedDurationSeconds()
+        let db = database
+
+        skipPlanTask = Task {
+            let plan = await AniSkipService.shared.resolveSkipPlan(
+                subjectID: subjectID,
+                episodeNumber: epNumber,
+                sessionTitle: title,
+                episodeDurationSeconds: durationSeconds,
+                database: db
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                episodeSkipPlan = plan
+                evaluateSkipDecisionNow()
+            }
+        }
+    }
+
+    private func evaluateSkipDecisionNow() {
+        guard !isSourcePanelPresented,
+              player.currentItem?.status == .readyToPlay,
+              let validTime = validatedPlaybackPosition(from: player.currentTime()) else {
+            if activeSkipAction != nil {
+                activeSkipAction = nil
+            }
+            return
+        }
+
+        let currentSeconds = validTime.seconds
+        let durationSeconds = Double(resolvedDurationSeconds())
+
+        let decision = SkipDecisionEngine.evaluate(
+            currentTime: currentSeconds,
+            duration: durationSeconds,
+            plan: episodeSkipPlan,
+            mode: skipOPEDMode,
+            fallbackOPSkipSeconds: fallbackOPSkipSeconds,
+            hasNextEpisode: hasNextEpisode,
+            skippedKinds: skippedSegmentKinds
+        )
+
+        switch decision {
+        case .none:
+            if activeSkipAction != nil {
+                activeSkipAction = nil
+            }
+        case .showPrompt(let action):
+            if activeSkipAction != action {
+                activeSkipAction = action
+            }
+        case .autoSkip(let segment):
+            performAutoSkip(segment: segment, durationSeconds: durationSeconds)
+        }
+    }
+
+    private func performAutoSkip(segment: SkipSegment, durationSeconds: Double) {
+        skippedSegmentKinds.insert(segment.kind)
+        activeSkipAction = nil
+
+        if segment.kind == .ed,
+           durationSeconds > 0,
+           segment.endTime >= durationSeconds - 10,
+           let nextEpisode {
+            showSkipToast("已自动跳过片尾，即将播放下一集")
+            finalizePlaybackProgress(trigger: "skip_ed_auto", shouldSyncCompletionToBangumi: true)
+            onSelectEpisode?(nextEpisode)
+            return
+        }
+
+        let clampedTarget = durationSeconds > 0
+            ? min(segment.endTime, max(0, durationSeconds - 1))
+            : segment.endTime
+        seekToSeconds(clampedTarget)
+        showSkipToast(segment.kind == .op ? "已自动跳过片头" : "已自动跳过片尾")
+    }
+
+    private func handlePerformSkipAction(_ action: PlayerSkipContextualAction) {
+        skippedSegmentKinds.insert(action.kind)
+        activeSkipAction = nil
+
+        if action.switchesToNextEpisode, let nextEpisode {
+            finalizePlaybackProgress(trigger: "skip_ed_prompt", shouldSyncCompletionToBangumi: true)
+            onSelectEpisode?(nextEpisode)
+            return
+        }
+
+        let durationSeconds = Double(resolvedDurationSeconds())
+        if let targetSeconds = action.targetSeconds {
+            let clamped = durationSeconds > 0
+                ? min(targetSeconds, max(0, durationSeconds - 1))
+                : targetSeconds
+            seekToSeconds(clamped)
+            showSkipToast(action.kind == .op ? "已跳过片头" : "已跳过片尾")
+        } else if action.kind == .op {
+            handleManualFallbackSkipOP()
+        }
+    }
+
+    private func handleManualFallbackSkipOP() {
+        guard let currentTime = validatedPlaybackPosition(from: player.currentTime()) else { return }
+        let durationSeconds = Double(resolvedDurationSeconds())
+        let rawTarget = currentTime.seconds + Double(fallbackOPSkipSeconds)
+        let target = durationSeconds > 0
+            ? min(rawTarget, max(currentTime.seconds, durationSeconds - 5))
+            : rawTarget
+        skippedSegmentKinds.insert(.op)
+        activeSkipAction = nil
+        seekToSeconds(target)
+        showSkipToast("已跳过片头 (+\(fallbackOPSkipSeconds)秒)")
+    }
+
+    private func handleRememberCurrentAsOPEnd() {
+        guard let currentTime = validatedPlaybackPosition(from: player.currentTime()) else { return }
+        let opEnd = currentTime.seconds
+        guard opEnd >= 10 else {
+            showSkipToast("当前位置过短，无法记录为片头结束")
+            return
+        }
+
+        let subjectID = episodeInfo.subjectId
+        let existingED = episodeSkipPlan.ed
+        let pref = SubjectSkipPreference(
+            subjectID: subjectID,
+            opStart: 0,
+            opEnd: opEnd,
+            edStart: existingED?.source == .custom ? existingED?.startTime : nil,
+            edEnd: existingED?.source == .custom ? existingED?.endTime : nil
+        )
+        Task {
+            try? await AniTVDatabase.upsertSubjectSkipPreference(pref, in: database)
+            await MainActor.run {
+                episodeSkipPlan = EpisodeSkipPlan(
+                    op: SkipSegment(kind: .op, startTime: 0, endTime: opEnd, source: .custom),
+                    ed: episodeSkipPlan.ed
+                )
+                skippedSegmentKinds.insert(.op)
+                activeSkipAction = nil
+                showSkipToast("已记住本番片头结束：\(formattedTimestamp(opEnd))")
+            }
+        }
+    }
+
+    private func handleClearCustomSkipPreference() {
+        let subjectID = episodeInfo.subjectId
+        Task {
+            try? await AniTVDatabase.deleteSubjectSkipPreference(forSubjectID: subjectID, in: database)
+            await MainActor.run {
+                skippedSegmentKinds.remove(.op)
+                showSkipToast("已清除本番片头记忆")
+                loadSkipPlan()
+            }
+        }
+    }
+
+    private func handleChangeSkipOPEDMode(_ mode: SkipOPEDMode) {
+        skipOPEDMode = mode
+        if mode == .off {
+            activeSkipAction = nil
+        }
+        Task {
+            try? await AniTVDatabase.setSkipOPEDMode(mode, in: database)
+        }
+        evaluateSkipDecisionNow()
+        showSkipToast("跳过 OP/ED：\(mode.displayTitle)")
+    }
+
+    private func seekToSeconds(_ seconds: Double) {
+        let targetTime = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
+        lastPlaybackPosition = targetTime
+        player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            player.play()
+        }
+    }
+
+    private func showSkipToast(_ message: String) {
+        skipToastTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) {
+            skipToastMessage = message
+        }
+        skipToastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.25)) {
+                skipToastMessage = nil
+            }
+        }
+    }
+
+    private func formattedTimestamp(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        let mins = total / 60
+        let secs = total % 60
+        return String(format: "%02d:%02d", mins, secs)
     }
 
     private func configurePlaybackProgressTracking() {
@@ -624,6 +1173,14 @@ struct AnimePlayerContainerView: View {
         ) { [weak player] _ in
             guard player != nil else { return }
             persistPlaybackProgress(trigger: "periodic")
+        }
+
+        skipTimeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
+            queue: .main
+        ) { [weak player] _ in
+            guard player != nil else { return }
+            evaluateSkipDecisionNow()
         }
 
         timeControlStatusObservation = player.observe(
@@ -648,6 +1205,10 @@ struct AnimePlayerContainerView: View {
             player.removeTimeObserver(periodicTimeObserver)
             self.periodicTimeObserver = nil
         }
+        if let skipTimeObserver {
+            player.removeTimeObserver(skipTimeObserver)
+            self.skipTimeObserver = nil
+        }
         timeControlStatusObservation?.invalidate()
         timeControlStatusObservation = nil
     }
@@ -661,6 +1222,10 @@ struct AnimePlayerContainerView: View {
         if let periodicTimeObserver = periodicTimeObserver {
             player.removeTimeObserver(periodicTimeObserver)
             self.periodicTimeObserver = nil
+        }
+        if let skipTimeObserver = skipTimeObserver {
+            player.removeTimeObserver(skipTimeObserver)
+            self.skipTimeObserver = nil
         }
         player.pause()
         player.replaceCurrentItem(with: nil)
@@ -678,31 +1243,45 @@ struct AnimePlayerContainerView: View {
                     candidateSorts.append(episodeInfo.sort)
                 }
 
-                let bangumi = try await DanDanPlayAPI.shared.getBangumiDetails(bgmId: episodeInfo.subjectId, targetSorts: candidateSorts)
+                let bangumi = try await DanDanPlayAPI.shared.getBangumiDetails(
+                    bgmId: episodeInfo.subjectId,
+                    animeTitle: sessionTitle,
+                    targetSorts: candidateSorts,
+                    targetAirDate: episodeInfo.airdate
+                )
                 let candidateStrings = candidateSorts.map { String(Int($0)) }
                 var matchedEpisode: DanDanPlayEpisode? = nil
-                
+
                 // 1. Exact match on episodeNumber or common title formats
                 for targetString in candidateStrings {
+                    let padded = targetString.count == 1 ? "0\(targetString)" : targetString
                     for ep in bangumi.episodes {
                         if ep.episodeNumber == targetString ||
                            ep.episodeTitle == targetString ||
+                           ep.episodeTitle == padded ||
                            ep.episodeTitle.contains("第\(targetString)话") ||
                            ep.episodeTitle.contains("第\(targetString)集") ||
-                           ep.episodeTitle == (targetString.count == 1 ? "0\(targetString)" : targetString) {
+                           ep.episodeTitle.contains("第\(padded)话") ||
+                           ep.episodeTitle.contains("第\(padded)集") ||
+                           ep.episodeTitle.localizedCaseInsensitiveContains("E\(padded)") ||
+                           ep.episodeTitle.localizedCaseInsensitiveContains("EP\(targetString)") ||
+                           ep.episodeTitle.localizedCaseInsensitiveContains("EP \(targetString)") {
                             matchedEpisode = ep
                             break
                         }
                     }
                     if matchedEpisode != nil { break }
                 }
-                
+
                 // 2. Match digit token in episodeTitle
                 if matchedEpisode == nil {
                     for targetString in candidateStrings {
+                        let targetInt = Int(targetString)
                         for ep in bangumi.episodes {
-                            let numbers = ep.episodeTitle.components(separatedBy: CharacterSet.decimalDigits.inverted).filter { !$0.isEmpty }
-                            if numbers.contains(targetString) {
+                            let numbers = ep.episodeTitle
+                                .components(separatedBy: CharacterSet.decimalDigits.inverted)
+                                .compactMap(Int.init)
+                            if let targetInt, numbers.contains(targetInt) {
                                 matchedEpisode = ep
                                 break
                             }
@@ -717,8 +1296,18 @@ struct AnimePlayerContainerView: View {
                         ep.airDate?.hasPrefix(episodeInfo.airdate) == true
                     })
                 }
-                
-                // 4. Substring fallback
+
+                // 4. Sequential 1-based index fallback for ordered episode lists
+                if matchedEpisode == nil,
+                   let firstSort = candidateSorts.first,
+                   firstSort >= 1 {
+                    let index = Int(firstSort) - 1
+                    if bangumi.episodes.indices.contains(index) {
+                        matchedEpisode = bangumi.episodes[index]
+                    }
+                }
+
+                // 5. Substring fallback
                 if matchedEpisode == nil {
                     for targetString in candidateStrings {
                         if let first = bangumi.episodes.first(where: { $0.episodeTitle.contains(targetString) }) {
@@ -804,7 +1393,13 @@ struct AnimePlayerContainerView: View {
     private func currentPlaybackProgressSnapshot(
         includeCompletionThreshold: Bool
     ) -> PlaybackProgressSnapshot? {
-        let resolvedTime = validatedPlaybackPosition(from: player.currentTime()) ?? lastPlaybackPosition
+        let validCurrentTime = validatedPlaybackPosition(from: player.currentTime())
+        let resolvedTime = Self.resolveResumePosition(
+            currentItemStatus: player.currentItem?.status,
+            currentPlayerTime: validCurrentTime,
+            lastPlaybackPosition: lastPlaybackPosition,
+            isApplyingResumeSeek: isApplyingResumeSeek
+        )
         guard let resolvedTime else { return nil }
 
         lastPlaybackPosition = resolvedTime

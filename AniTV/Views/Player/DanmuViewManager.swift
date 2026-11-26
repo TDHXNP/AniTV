@@ -17,6 +17,8 @@ class DanmuViewManager {
     private var statusObservation: NSKeyValueObservation?
     private weak var player: AVPlayer?
     
+    private var desiredDisplayArea: CGFloat = 1.0
+
     var isEnabled: Bool = true {
         didSet {
             danmuView.isHidden = !isEnabled
@@ -28,10 +30,11 @@ class DanmuViewManager {
     
     var displayArea: CGFloat {
         get {
-            return danmuView.displayArea
+            return desiredDisplayArea
         }
         set {
-            danmuView.displayArea = newValue
+            desiredDisplayArea = min(max(newValue, 0.125), 1.0)
+            danmuView.displayArea = desiredDisplayArea
             danmuView.recaculateTracks()
         }
     }
@@ -42,8 +45,8 @@ class DanmuViewManager {
         provider.onSendTextModel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] model in
-                print("[DanmuViewManager] Received danmaku model: '\(model.text)' -> shooting to danmuView")
-                self?.danmuView.shoot(danmaku: model)
+                guard let self, self.isEnabled else { return }
+                self.danmuView.shoot(danmaku: model)
             }
             .store(in: &cancellables)
     }
@@ -64,7 +67,8 @@ class DanmuViewManager {
         
         container.layoutIfNeeded()
         danmuView.trackHeight = 52
-        danmuView.displayArea = 0.8
+        danmuView.displayArea = desiredDisplayArea
+        danmuView.isHidden = !isEnabled
         danmuView.recaculateTracks()
         
         print("[DanmuViewManager] After layout, danmuView bounds: \(danmuView.bounds)")

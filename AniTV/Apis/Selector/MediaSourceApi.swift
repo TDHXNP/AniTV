@@ -432,9 +432,22 @@ struct MediaSourceEngineHelpers {
 // MARK: - LabelFirstRawTitleParser Placeholder
 class LabelFirstRawTitleParser {
     func parseSubtitleLanguages(_ text: String) -> [SubtitleLanguage] {
-        if text.contains("简中") { return [.chineseSimplified] }
-        if text.contains("繁中") { return [.chineseTraditional] }
-        return []
+        let lower = text.lowercased()
+        let simplifiedMarkers = ["简中", "簡中", "简体", "簡體", "简日", "簡日", "简字", "簡字", "中简", "中簡", "zh-hans", "zh_hans"]
+        let traditionalMarkers = ["繁中", "繁体", "繁體", "繁日", "繁字", "中繁", "zh-hant", "zh_hant", "big5"]
+
+        let hasSimplified = simplifiedMarkers.contains { lower.contains($0) } || matchesWordToken("chs", in: lower)
+        let hasTraditional = traditionalMarkers.contains { lower.contains($0) } || matchesWordToken("cht", in: lower)
+
+        var languages: [SubtitleLanguage] = []
+        if hasSimplified { languages.append(.chineseSimplified) }
+        if hasTraditional { languages.append(.chineseTraditional) }
+        return languages
+    }
+
+    private func matchesWordToken(_ token: String, in text: String) -> Bool {
+        let tokens = text.components(separatedBy: CharacterSet.alphanumerics.inverted)
+        return tokens.contains(token)
     }
 }
 

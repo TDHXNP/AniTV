@@ -81,20 +81,48 @@ struct VideoSource {
 struct VideoResource {
     let resourceName: String
     let url: String
-//    let headers: [String: String]
-    let matchConfig: SelectorSearchConfig.MatchVideoConfig
+    let matchConfig: SelectorSearchConfig.MatchVideoConfig?
+    let directPlayURL: URL?
+    let directHeaders: [String: String]
+
+    init(
+        resourceName: String,
+        url: String,
+        matchConfig: SelectorSearchConfig.MatchVideoConfig? = nil,
+        directPlayURL: URL? = nil,
+        directHeaders: [String: String] = [:]
+    ) {
+        self.resourceName = resourceName
+        self.url = url
+        self.matchConfig = matchConfig
+        self.directPlayURL = directPlayURL
+        self.directHeaders = directHeaders
+    }
 }
 
 struct AdvancedVideoPlayer: UIViewControllerRepresentable {
     let player: AVPlayer
     let title: String
-    let sort: Int
+    let episodes: [BgmEpisodeInfo]
+    let currentEpisode: BgmEpisodeInfo
     var availableSources: [VideoSource]
     @Binding var isSourcePanelPresented: Bool
     var danmuManager: DanmuViewManager?
     var isDanmakuAvailable: Bool = true
+    var activeSkipAction: PlayerSkipContextualAction? = nil
+    var skipOPEDMode: SkipOPEDMode = AniTVDatabase.defaultSkipOPEDMode
+    var skipPlanSourceDescription: String = "默认兜底模式"
+    var hasCustomSkipPreference: Bool = false
+    var fallbackOPSkipSeconds: Int = AniTVDatabase.defaultFallbackOPSkipSeconds
     var onExitRequest: (() -> Void)? = nil
+    var onSelectEpisode: ((BgmEpisodeInfo) -> Void)? = nil
     var onDanmakuToggled: ((Bool) -> Void)? = nil
+    var onDanmakuDisplayAreaChanged: ((CGFloat) -> Void)? = nil
+    var onPerformSkipAction: ((PlayerSkipContextualAction) -> Void)? = nil
+    var onChangeSkipMode: ((SkipOPEDMode) -> Void)? = nil
+    var onManualFallbackSkipOP: (() -> Void)? = nil
+    var onRememberCurrentAsOPEnd: (() -> Void)? = nil
+    var onClearCustomSkipPreference: (() -> Void)? = nil
     
     // 选中的线路回调（如果需要通知外部去切换 m3u8）
     var onSourceSelected: ((Int, Int, VideoResource) -> Void)?
@@ -105,7 +133,9 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
         var detailsHostingController: UIHostingController<AniTVCustomDropdownView>?
         weak var currentDanmuManager: DanmuViewManager?
         var isDanmakuEnabled: Bool = AniTVDatabase.resolvedInitialDanmakuEnabled()
-        var selectedDisplayArea: CGFloat = 1.0
+        var selectedDisplayArea: CGFloat = AniTVDatabase.resolvedInitialDanmakuDisplayArea()
+        var lastAppliedContextualActionKey: String?
+        var onPerformSkipAction: ((PlayerSkipContextualAction) -> Void)?
         weak var controller: AVPlayerViewController?
 
         // MARK: - AVPlayerViewControllerDelegate
@@ -181,9 +211,17 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
             guard !isSourcePanelPresented else { return }
             isSourcePanelPresented = true
         }
-        let detailsHostingController = UIHostingController(rootView: AniTVCustomDropdownView(title: title, sort: sort))
+        let detailsHostingController = UIHostingController(
+            rootView: AniTVCustomDropdownView(
+                title: title,
+                episodes: episodes,
+                currentEpisode: currentEpisode,
+                onSelectEpisode: onSelectEpisode
+            )
+        )
         detailsHostingController.view.backgroundColor = .clear
         detailsHostingController.title = String(localized: .nextUp)
+        detailsHostingController.preferredContentSize = CGSize(width: 1920, height: 270)
         context.coordinator.detailsHostingController = detailsHostingController
 
         context.coordinator.sourcePanelModel.update(sources: availableSources, onSourceSelected: onSourceSelected)
@@ -210,7 +248,9 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
         setupDanmuManagerIfNeeded(controller: controller, context: context)
         
         controller.infoViewActions = [startOverAction, favoriteAction]
-        controller.transportBarCustomMenuItems = [getSourcePanelAction(), getPipAction(uiViewController: controller, context: context), getDanmakuMenu(uiViewController: controller, context: context)]
+        context.coordinator.onPerformSkipAction = onPerformSkipAction
+        applyContextualSkipAction(to: controller, context: context)
+        controller.transportBarCustomMenuItems = buildTransportBarMenuItems(uiViewController: controller, context: context)
         return controller
     }
     
@@ -219,6 +259,7 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
         uiViewController.delegate = context.coordinator
         uiViewController.allowsPictureInPicturePlayback = true
         context.coordinator.controller = uiViewController
+        context.coordinator.onPerformSkipAction = onPerformSkipAction
         if let controller = uiViewController as? AniTVPlayerViewController {
             uiViewController.showsPlaybackControls = !isSourcePanelPresented
             controller.shouldIgnoreUpArrow = isSourcePanelPresented
@@ -231,9 +272,100 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
             setupDanmuManagerIfNeeded(controller: controller, context: context)
         }
         setupPipControllerIfNeeded(controller: uiViewController, context: context)
-        context.coordinator.detailsHostingController?.rootView = AniTVCustomDropdownView(title: title, sort: sort)
+        context.coordinator.detailsHostingController?.rootView = AniTVCustomDropdownView(
+            title: title,
+            episodes: episodes,
+            currentEpisode: currentEpisode,
+            onSelectEpisode: onSelectEpisode
+        )
         context.coordinator.sourcePanelModel.update(sources: availableSources, onSourceSelected: onSourceSelected)
-        uiViewController.transportBarCustomMenuItems = [getSourcePanelAction(), getPipAction(uiViewController: uiViewController, context: context), getDanmakuMenu(uiViewController: uiViewController, context: context)]
+        applyContextualSkipAction(to: uiViewController, context: context)
+        uiViewController.transportBarCustomMenuItems = buildTransportBarMenuItems(uiViewController: uiViewController, context: context)
+    }
+
+    private func buildTransportBarMenuItems(uiViewController: AVPlayerViewController, context: Context) -> [UIMenuElement] {
+        [
+            getSourcePanelAction(),
+            getSkipMenu(),
+            getPipAction(uiViewController: uiViewController, context: context),
+            getDanmakuMenu(uiViewController: uiViewController, context: context)
+        ]
+    }
+
+    private func applyContextualSkipAction(to controller: AVPlayerViewController, context: Context) {
+        let effectiveAction = isSourcePanelPresented ? nil : activeSkipAction
+        let desiredKey = effectiveAction?.id
+        guard context.coordinator.lastAppliedContextualActionKey != desiredKey else { return }
+        context.coordinator.lastAppliedContextualActionKey = desiredKey
+
+        if let action = effectiveAction {
+            let uiAction = UIAction(
+                title: action.title,
+                image: UIImage(systemName: action.systemImage)
+            ) { [weak coordinator = context.coordinator] _ in
+                coordinator?.onPerformSkipAction?(action)
+            }
+            controller.contextualActions = [uiAction]
+        } else {
+            controller.contextualActions = []
+        }
+    }
+
+    private func getSkipMenu() -> UIMenu {
+        let modeActions = SkipOPEDMode.allCases.map { mode in
+            UIAction(
+                title: mode.displayTitle,
+                state: mode == skipOPEDMode ? .on : .off
+            ) { _ in
+                onChangeSkipMode?(mode)
+            }
+        }
+
+        let modeSubmenu = UIMenu(
+            title: "模式 · \(skipPlanSourceDescription)",
+            options: [.displayInline, .singleSelection],
+            children: modeActions
+        )
+
+        var quickActions: [UIMenuElement] = [
+            UIAction(
+                title: "跳过片头 (+\(fallbackOPSkipSeconds)秒)",
+                image: UIImage(systemName: "goforward")
+            ) { _ in
+                onManualFallbackSkipOP?()
+            },
+            UIAction(
+                title: "记住当前位置为片头结束",
+                image: UIImage(systemName: "bookmark.fill")
+            ) { _ in
+                onRememberCurrentAsOPEnd?()
+            }
+        ]
+
+        if hasCustomSkipPreference {
+            quickActions.append(
+                UIAction(
+                    title: "清除本番片头记忆",
+                    image: UIImage(systemName: "trash"),
+                    attributes: [.destructive]
+                ) { _ in
+                    onClearCustomSkipPreference?()
+                }
+            )
+        }
+
+        let actionsSubmenu = UIMenu(
+            title: "快捷操作",
+            options: [.displayInline],
+            children: quickActions
+        )
+
+        let iconName = skipOPEDMode == .off ? "forward.end" : "forward.end.fill"
+        return UIMenu(
+            title: "跳过 OP/ED",
+            image: UIImage(systemName: iconName),
+            children: [modeSubmenu, actionsSubmenu]
+        )
     }
 
     private func getDanmakuMenu(uiViewController: AVPlayerViewController, context: Context) -> UIMenu {
@@ -248,13 +380,12 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
             guard isDanmakuAvailable else { return }
             context.coordinator.isDanmakuEnabled.toggle()
             let newEnabled = context.coordinator.isDanmakuEnabled
-            danmuManager?.isEnabled = newEnabled
+            (context.coordinator.currentDanmuManager ?? danmuManager)?.isEnabled = newEnabled
             onDanmakuToggled?(newEnabled)
-            uiViewController.transportBarCustomMenuItems = [
-                getSourcePanelAction(),
-                getPipAction(uiViewController: uiViewController, context: context),
-                getDanmakuMenu(uiViewController: uiViewController, context: context)
-            ]
+            uiViewController.transportBarCustomMenuItems = buildTransportBarMenuItems(
+                uiViewController: uiViewController,
+                context: context
+            )
         }
         
         let areaOptions: [(title: String, area: CGFloat)] = [
@@ -273,12 +404,12 @@ struct AdvancedVideoPlayer: UIViewControllerRepresentable {
             ) { _ in
                 guard isDanmakuAvailable else { return }
                 context.coordinator.selectedDisplayArea = item.area
-                danmuManager?.displayArea = item.area
-                uiViewController.transportBarCustomMenuItems = [
-                    getSourcePanelAction(),
-                    getPipAction(uiViewController: uiViewController, context: context),
-                    getDanmakuMenu(uiViewController: uiViewController, context: context)
-                ]
+                (context.coordinator.currentDanmuManager ?? danmuManager)?.displayArea = item.area
+                onDanmakuDisplayAreaChanged?(item.area)
+                uiViewController.transportBarCustomMenuItems = buildTransportBarMenuItems(
+                    uiViewController: uiViewController,
+                    context: context
+                )
             }
         }
         
