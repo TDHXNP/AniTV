@@ -81,6 +81,50 @@ extension AniTVDatabase {
         }
     }
 
+    struct BangumiMalLookupInfo: Sendable {
+        let originalTitle: String
+        let beginDate: String
+        let malID: Int?
+    }
+
+    static func bangumiMalLookupInfo(
+        forBangumiID bangumiID: String,
+        in database: any DatabaseWriter
+    ) async throws -> BangumiMalLookupInfo? {
+        try await database.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT
+                  "title",
+                  "begin",
+                  (
+                    SELECT json_extract(site.value, '$.id')
+                    FROM json_each("bangumi_data"."sites") AS site
+                    WHERE json_extract(site.value, '$.site') IN ('mal', 'myanimelist')
+                    LIMIT 1
+                  ) AS "mal_id"
+                FROM "bangumi_data"
+                WHERE "bangumi_id" = ?
+                LIMIT 1
+                """,
+                arguments: [bangumiID]
+            ) else {
+                return nil
+            }
+
+            let title: String = row["title"] ?? ""
+            let begin: String = row["begin"] ?? ""
+            let malIDString: String? = row["mal_id"]
+            let malID = malIDString.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return BangumiMalLookupInfo(
+                originalTitle: title,
+                beginDate: begin,
+                malID: malID
+            )
+        }
+    }
+
     static func tmdbIDForBangumiID(
         _ bangumiID: String,
         in database: any DatabaseWriter

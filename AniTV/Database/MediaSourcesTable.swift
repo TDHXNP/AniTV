@@ -121,7 +121,7 @@ extension AniTVDatabase {
         return shouldRefresh
     }
 
-    static func refreshMediaSourcesIfNeeded(in database: DatabaseQueue) async throws -> Bool {
+    static func refreshMediaSourcesIfNeeded(in database: any DatabaseWriter) async throws -> Bool {
         guard let subscription = try await defaultMediaSourceSubscription(in: database) else {
             throw MediaSourceConfigLoaderError.invalidResponse
         }
@@ -178,6 +178,21 @@ extension AniTVDatabase {
         }
     }
 
+    static func fetchMediaSourceNames(
+        in database: any DatabaseWriter
+    ) async throws -> [String] {
+        let configs = try await fetchMediaSourceConfigs(in: database)
+        var seen = Set<String>()
+        var names: [String] = []
+        for config in configs {
+            guard let rawName = config.arguments?.name else { continue }
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, seen.insert(name).inserted else { continue }
+            names.append(name)
+        }
+        return names
+    }
+
     private static func defaultMediaSourceSubscription(
         in database: any DatabaseWriter
     ) async throws -> MediaSourceSubscriptionRecord? {
@@ -213,7 +228,7 @@ extension AniTVDatabase {
         _ sources: [ExportedMediaSource],
         subscriptionID: Int,
         fetchedAt: Date,
-        in database: DatabaseQueue
+        in database: any DatabaseWriter
     ) async throws {
         try await database.write { db in
             try db.execute(

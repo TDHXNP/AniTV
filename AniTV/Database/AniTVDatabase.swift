@@ -25,6 +25,8 @@ enum AniTVDatabase {
         registerLocalEpisodeWatchStateMigrations(in: &migrator)
         registerCachedUserCollectionsMigrations(in: &migrator)
         registerTMDBEpisodeStillCacheMigrations(in: &migrator)
+        registerAniSkipMigrations(in: &migrator)
+        registerLocalMediaSourceMigrations(in: &migrator)
         try migrator.migrate(database)
         return database
     }
